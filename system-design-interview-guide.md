@@ -774,3 +774,447 @@ Seed URLs → URL Frontier (priority queue)
 - BFS vs DFS: BFS finds important pages first (broader coverage); DFS goes deeper into specific sites. BFS preferred for general crawlers.
 - Bloom filter vs Exact set: Bloom filter uses ~12 GB for 10B URLs (vs 1 TB for hash set); accepts ~1% false positive (skip some valid URLs)
 - Store raw HTML vs Parsed text: Raw is larger but preserves structure for re-processing; parsed is smaller but lossy
+
+## Section 4: Data Platform Questions
+
+### Question 11: Design a Stream Processing System (Flink/Spark Streaming)
+
+**Requirements**
+- Functional: Ingest continuous event streams, apply transformations/aggregations, produce output to sinks (DB, queue, lake). Support windowed aggregations (tumbling, sliding, session). Exactly-once processing semantics.
+- Non-functional: Sub-second latency for simple transforms, low-single-digit seconds for windowed aggregations. Handle 1M+ events/sec. Fault-tolerant with automatic recovery. Backpressure handling to avoid data loss.
+- Scale: 1M events/sec ingestion, 1 KB avg event size → ~1 GB/s throughput. Thousands of parallel tasks across hundreds of nodes.
+
+**Estimation**
+```
+Events:           1M/sec × 1 KB = 1 GB/sec ingestion
+State size:       Windows × keys × value size. E.g., 5-min window, 1M keys, 100 bytes = 100 GB state
+Checkpoints:      State snapshot every 30-60 sec → 100 GB written per checkpoint
+Output:           ~500K aggregated results/sec to sinks
+Cluster:          ~200 task slots across 50 nodes (4 slots each)
+```
+
+**High-Level Design**
+```
+Data Sources (Kafka topics)
+       │
+       ▼
+┌─────────────────────────┐
+│     Source Operators     │  (parallel readers, one per partition)
+└─────────┬───────────────┘
+          │
+          ▼
+┌─────────────────────────┐
+│  Processing Operators   │  (map, filter, keyBy, window, aggregate)
+│  ┌───────────────────┐  │
+│  │  State Backend     │  │  (RocksDB for large state, heap for small)
+│  └───────────────────┘  │
+└─────────┬───────────────┘
+          │
+          ▼
+┌─────────────────────────┐
+│     Sink Operators      │  (write to Kafka, DB, cloud storage)
+└─────────────────────────┘
+
+Coordination:
+┌──────────────────┐     ┌──────────────────┐
+│   Job Manager    │────▶│ Checkpoint Store  │ (GCS/S3/HDFS)
+│  (coordination,  │     └──────────────────┘
+│   scheduling)    │
+└──────────────────┘
+```
+
+**Key Components**
+
+*Windowing:*
+- Tumbling: Fixed non-overlapping intervals (e.g., every 5 min)
+- Sliding: Overlapping intervals (5-min window every 1 min)
+- Session: Gap-based, per key (close window after N min inactivity)
+- Watermarks: Track event-time progress, trigger window evaluation. Watermark = max_event_time - allowed_lateness.
+
+*Exactly-Once Semantics:*
+- Source: Replayable sources (Kafka offsets). On recovery, replay from last committed offset.
+- Internal: Checkpoint barriers flow through the DAG. Aligned barriers ensure consistent snapshots across all operators. On failure, restore state from last checkpoint and replay.
+- Sink: Idempotent writes (upsert by key) or two-phase commit (pre-commit on checkpoint, commit on checkpoint-complete).
+
+*Checkpointing:*
+- Periodic async snapshots of all operator state.
+- Barrier alignment: Barriers from job manager flow through DAG. Operator snapshots state when barrier arrives from all inputs.
+- Incremental checkpoints: Only write changed state (RocksDB SST diffs). Reduces checkpoint size from 100 GB to ~1-5 GB incremental.
+
+*Backpressure:*
+- Credit-based flow control: Downstream operators advertise available buffer capacity. Upstream slows when no credits available.
+- Propagates naturally through the DAG to sources.
+- Metrics: Track buffer utilization per operator to identify bottlenecks.
+
+**Deep Dive**
+- **State management:** RocksDB state backend for large state (spills to disk, supports incremental checkpoints). Heap backend for small state (<1 GB, faster access). State TTL to auto-expire stale keys.
+- **Late data:** Watermarks define "completeness." Late events (after watermark) can trigger side-output or update previously emitted results. Allowed lateness window: keep window state for extra time to handle stragglers.
+- **Rescaling:** Redistribute state across new parallelism. Key-group-based state partitioning — state split into max-parallelism key groups, redistributed on scale-up/down.
+- **Failure recovery:** On task failure, restart from last successful checkpoint. All operators restore state, sources replay from checkpointed offsets. Recovery time = checkpoint restore + replay gap (typically 10-30 sec).
+
+**Trade-offs**
+- Micro-batch (Spark Streaming) vs Continuous (Flink): Micro-batch has higher latency (~seconds) but simpler exactly-once; continuous has sub-second latency but more complex state management.
+- Aligned vs Unaligned checkpoints: Aligned is simpler but can cause backpressure during checkpoint; unaligned avoids this but increases checkpoint size.
+- Event time vs Processing time: Event time gives correct results for out-of-order data but requires watermarks and buffering; processing time is simpler but less accurate.
+
+---
+
+### Question 12: Design a Data Lake / Lakehouse Platform
+
+**Requirements**
+- Functional: Ingest data from diverse sources (streaming, batch, CDC). Store structured/semi-structured data on cloud object storage. Support SQL queries, ML workloads, and batch ETL. Schema enforcement and evolution. ACID transactions on the lake.
+- Non-functional: Petabyte-scale storage. Query latency from seconds (interactive) to hours (batch). 99.9% availability for query engine. Cost-efficient (separate storage and compute).
+- Scale: 10 PB total data, 100 TB daily ingestion, 1000+ concurrent users, 10K+ tables.
+
+**Estimation**
+```
+Storage:          10 PB on cloud storage (GCS/S3) at ~$20/TB/mo = $200K/mo
+Daily ingestion:  100 TB/day → ~1.2 GB/sec sustained
+Tables:           10K tables, avg 1 TB each, Parquet format (~3:1 compression)
+Queries:          1000 concurrent users × 10 queries/day = 10K queries/day
+Metadata:         10K tables × 1000 partitions × 100 files = 1B file entries
+```
+
+**High-Level Design**
+```
+Data Sources                        Query Engines
+(Kafka, DBs, APIs, Files)          (Spark, Presto/Trino, Hive)
+       │                                    │
+       ▼                                    ▼
+┌──────────────┐               ┌───────────────────┐
+│  Ingestion   │               │   Query Planning   │
+│  Layer       │               │   & Optimization   │
+│ (batch/CDC/  │               └────────┬──────────┘
+│  streaming)  │                        │
+└──────┬───────┘                        │
+       │          ┌─────────────┐       │
+       └─────────▶│  Table      │◀──────┘
+                  │  Format     │
+                  │ (Delta/     │
+                  │  Iceberg/   │
+                  │  Hudi)      │
+                  └──────┬──────┘
+                         │
+              ┌──────────┼──────────┐
+              ▼          ▼          ▼
+        ┌──────────┐ ┌────────┐ ┌────────────┐
+        │ Metadata │ │ Data   │ │ Catalog    │
+        │ (txn log,│ │(Parquet│ │(Hive Meta- │
+        │ manifest)│ │on GCS/ │ │ store/     │
+        │          │ │S3)     │ │ Unity/     │
+        └──────────┘ └────────┘ │ Glue)      │
+                                └────────────┘
+```
+
+**Key Components**
+
+*Storage Layer:*
+- Columnar formats: Parquet (most common) or ORC. Column pruning, predicate pushdown, efficient compression.
+- Partitioning: By date/region/key. Reduces scan scope. Avoid over-partitioning (small files problem).
+- File sizing: Target 128 MB-1 GB per file. Small files degrade query performance (metadata overhead, task scheduling).
+
+*Table Format (Delta/Iceberg/Hudi):*
+- Transaction log: Ordered log of commits (add/remove files). Provides ACID — concurrent writers use optimistic concurrency.
+- Schema evolution: Add/rename/drop columns without rewriting data. Reader handles missing columns with defaults.
+- Time travel: Query data as of any past commit/timestamp. Enabled by retaining old file references in the transaction log.
+- Compaction: Background process merges small files into larger ones. Z-order or Hilbert curve clustering for multi-dimensional query optimization.
+
+*Metadata Catalog:*
+- Central registry of tables, schemas, partitions, and statistics.
+- Hive Metastore (legacy) or modern catalogs (Unity Catalog, AWS Glue, Nessie).
+- Column-level statistics (min/max, null count, distinct count) for query optimization.
+
+*Ingestion Patterns:*
+- Batch: Spark jobs writing partitioned Parquet. Append or overwrite partitions.
+- CDC (Change Data Capture): Debezium → Kafka → merge into lake table (upsert by primary key).
+- Streaming: Spark Structured Streaming or Flink writing micro-batches to Delta/Iceberg tables.
+
+**Deep Dive**
+- **Query optimization:** Partition pruning (skip irrelevant partitions), data skipping via min/max stats (skip files where predicate cannot match), Z-ordering co-locates related data to maximize skipping effectiveness.
+- **Concurrency control:** Optimistic concurrency — writers check for conflicts at commit time. Conflict if two writers modify same partition/files. Retry on conflict. Readers always see consistent snapshot (MVCC via transaction log).
+- **Small file problem:** Many small files degrade performance. Auto-compaction merges files. Bin-packing: group small files into target size. Scheduled compaction jobs (e.g., hourly).
+- **Cost optimization:** Separate storage (cheap, $20/TB/mo on GCS/S3) from compute (expensive, on-demand). Lifecycle policies: move cold data to archive tiers. Cache hot data on local SSD for interactive queries.
+
+**Trade-offs**
+- Delta vs Iceberg vs Hudi: Delta is Spark-native with strong Databricks integration; Iceberg has better multi-engine support and hidden partitioning; Hudi excels at upsert-heavy workloads with record-level indexing.
+- Parquet vs ORC: Parquet is more widely adopted (Spark default, better ecosystem support); ORC has better built-in indexing and is Hive-native.
+- Single large cluster vs Multiple small clusters: Large cluster has better resource utilization; multiple clusters provide isolation and independent scaling per workload.
+
+---
+
+### Question 13: Design a Workflow/Pipeline Orchestration System (Airflow-like)
+
+**Requirements**
+- Functional: Define pipelines as DAGs (directed acyclic graphs). Schedule DAGs on cron or event triggers. Manage task dependencies, retries, and timeouts. Support backfill (re-run historical date ranges). Provide UI for monitoring, logs, and manual actions.
+- Non-functional: Execute 100K+ task instances/day. No single point of failure. Task execution exactly-once semantics (or at-least-once with idempotent tasks). Sub-minute scheduling latency.
+- Scale: 10K DAGs, 100K task instances/day, 1000 concurrent tasks.
+
+**Estimation**
+```
+DAGs:             10K DAGs, avg 10 tasks each = 100K task definitions
+Task instances:   100K/day = ~1.2/sec avg, peak 10/sec
+Execution:        1000 concurrent tasks × avg 10 min = ~170 worker slots needed
+Metadata DB:      100K rows/day × 365 days × 1 KB = ~36 GB/year
+Logs:             100K tasks/day × 100 KB avg log = 10 GB/day
+```
+
+**High-Level Design**
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   Web UI     │    │  CLI / API   │    │  DAG Files   │
+└──────┬───────┘    └──────┬───────┘    │  (Git repo)  │
+       │                   │            └──────┬───────┘
+       ▼                   ▼                   ▼
+┌─────────────────────────────────────────────────┐
+│                  API Server                      │
+│  (DAG parsing, REST API, auth)                  │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│                  Scheduler                       │
+│  (DAG scheduling, dependency resolution,         │
+│   task queuing, trigger management)              │
+└──────────┬────────────────────┬─────────────────┘
+           │                    │
+           ▼                    ▼
+┌──────────────────┐  ┌──────────────────┐
+│   Metadata DB    │  │   Task Queue     │
+│  (PostgreSQL)    │  │  (Redis/Celery/  │
+│  - DAG state     │  │   K8s queue)     │
+│  - Task state    │  └────────┬─────────┘
+│  - Run history   │           │
+└──────────────────┘           ▼
+                     ┌──────────────────┐
+                     │   Workers        │
+                     │  (execute tasks, │
+                     │   report status) │
+                     │  ┌────┐ ┌────┐   │
+                     │  │ W1 │ │ W2 │...│
+                     │  └────┘ └────┘   │
+                     └──────────────────┘
+```
+
+**Key Components**
+
+*DAG Parsing & Scheduling:*
+- DAGs defined as code (Python). Parsed by scheduler to build dependency graph.
+- Scheduler loop: For each active DAG, check if schedule interval has elapsed. For each ready run, find tasks with all dependencies met → enqueue.
+- Scheduler HA: Multiple schedulers with distributed locking (DB row-level locks) to avoid duplicate scheduling.
+
+*Task Lifecycle:*
+```
+scheduled → queued → running → success/failed/up_for_retry
+                              → upstream_failed (dep failed)
+```
+- Retries: Configurable per task (retry count, delay, exponential backoff).
+- Timeouts: Execution timeout (kill task), DAG-level timeout.
+- SLAs: Alert when task doesn't complete by expected time.
+
+*Executor Models:*
+- Local: Single-machine, tasks run as subprocesses. Good for development.
+- Celery: Distributed workers via message queue (Redis/RabbitMQ). Persistent workers.
+- Kubernetes: Each task runs as a K8s pod. Best isolation, auto-scaling, but higher overhead per task.
+
+*Backfill:*
+- Re-run DAG for historical date range. Creates task instances for each past interval.
+- Respects dependencies. Can run multiple dates in parallel (configurable).
+- Idempotent tasks required — re-execution must produce same result (overwrite partition, upsert by key).
+
+**Deep Dive**
+- **Dependency management:** Task dependencies within a DAG (upstream/downstream). Cross-DAG dependencies via sensors (poll for external condition) or dataset-triggered DAGs (DAG runs when upstream DAG writes to a dataset).
+- **Scalability bottleneck — Scheduler:** Scheduler must scan all DAGs and tasks. At scale (10K DAGs), single-loop scheduling becomes slow. Solutions: multiple schedulers with DB-based locking, DAG-level sharding, priority queues.
+- **Exactly-once execution:** Queue can deliver task twice (worker crash after dequeue). Rely on idempotent tasks + DB state. Worker heartbeat — if heartbeat lost, scheduler marks task as failed and re-queues. DB records final state.
+- **Observability:** Task logs stored in cloud storage (GCS/S3), accessible via UI. Metrics: task duration, queue time, failure rate. Alerts on SLA miss, repeated failures.
+
+**Trade-offs**
+- DAGs-as-code vs YAML config: Code is flexible and testable but can introduce bugs and is harder to validate statically; YAML is simpler and declarative but limited in expressiveness.
+- Pull-based (workers pull tasks) vs Push-based (scheduler assigns tasks): Pull is simpler and naturally load-balances; push gives scheduler more control over placement and priority.
+- Celery vs Kubernetes executor: Celery has lower overhead per task (persistent workers) but less isolation; K8s has per-task isolation and auto-scaling but higher startup latency (~10-30 sec pod spin-up).
+
+---
+
+### Question 14: Design a Data Quality & Observability Platform
+
+**Requirements**
+- Functional: Define and evaluate data quality rules (schema, nulls, ranges, uniqueness, referential integrity). Detect anomalies (volume changes, distribution drift). Track data lineage (column-level). Monitor freshness (when was table last updated). Alert on violations.
+- Non-functional: Evaluate rules within minutes of data landing. Scale to 10K+ tables. Low false-positive rate on anomaly detection. Minimal performance impact on production pipelines.
+- Scale: 10K tables, 100K quality rules, 1M rule evaluations/day.
+
+**Estimation**
+```
+Tables:           10K tables monitored
+Rules:            100K rules (avg 10 per table)
+Evaluations:      1M/day = ~12/sec avg
+Rule execution:   Avg 10 sec per rule (SQL query against table)
+Compute:          12 concurrent evaluations × 10 sec = ~120 concurrent queries
+Metadata:         1M evaluation results/day × 500 bytes = 500 MB/day
+Lineage graph:    10K tables × 50 columns = 500K column nodes, ~2M edges
+```
+
+**High-Level Design**
+```
+┌──────────────────────────────────────────────┐
+│                    UI / Dashboard             │
+│  (rule management, lineage viewer, alerts)   │
+└──────────────────┬───────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────┐
+│                 API Server                    │
+└───────┬──────────┬──────────┬────────────────┘
+        │          │          │
+        ▼          ▼          ▼
+┌────────────┐ ┌─────────┐ ┌──────────────┐
+│ Rule       │ │ Anomaly │ │ Lineage      │
+│ Engine     │ │ Detector│ │ Service      │
+│            │ │         │ │              │
+│ - Schema   │ │ - Stats │ │ - Parse SQL/ │
+│ - Null %   │ │   model │ │   Spark plans│
+│ - Range    │ │ - Volume│ │ - Column-    │
+│ - Unique   │ │   drift │ │   level DAG  │
+│ - Custom   │ │ - Dist  │ │ - Impact     │
+│   SQL      │ │   shift │ │   analysis   │
+└─────┬──────┘ └────┬────┘ └──────┬───────┘
+      │             │             │
+      ▼             ▼             ▼
+┌──────────────────────────────────────────────┐
+│            Metadata Store (PostgreSQL)        │
+│  Rules, results, lineage graph, alert config │
+└──────────────────────────────────────────────┘
+      │
+      ▼
+┌──────────────────┐    ┌──────────────────┐
+│  Alert Service   │    │  Data Warehouse  │
+│  (PagerDuty,     │    │  / Lake (execute │
+│   Slack, email)  │    │   quality queries│
+└──────────────────┘    └──────────────────┘
+```
+
+**Key Components**
+
+*Rule Engine:*
+- Rule types: Schema (column exists, type matches), completeness (null percentage < threshold), validity (values in expected range/set), uniqueness (no duplicates on key columns), freshness (updated within N hours), custom SQL (arbitrary boolean query).
+- Rules translated to SQL queries executed against the data warehouse/lake.
+- Evaluation triggered by: pipeline completion event, schedule, or manual.
+
+*Anomaly Detection:*
+- Statistical profiling: Maintain rolling statistics per column (mean, stddev, percentiles, distinct count, null rate).
+- Volume monitoring: Track row count per partition. Alert on significant deviation from historical pattern (e.g., >3 sigma from 7-day rolling average).
+- Distribution drift: Compare current value distribution against baseline (KL divergence, KS test). Detect when data semantics change.
+
+*Data Lineage:*
+- Parse SQL queries and Spark execution plans to extract column-level lineage.
+- Build DAG: source columns → transformations → target columns.
+- Impact analysis: Given a quality issue in table A, which downstream tables/dashboards are affected?
+- Root cause: Given bad data in table Z, trace back to find the source table/column where the issue originated.
+
+*Freshness Monitoring:*
+- Track last-modified timestamp for each table/partition.
+- Expected freshness SLA per table (e.g., updated within 2 hours of midnight).
+- Alert when table is stale (not updated within SLA window).
+
+**Deep Dive**
+- **Minimizing performance impact:** Run quality queries during off-peak hours or on read replicas. Sample large tables instead of full scans (e.g., 1% sample for distribution checks). Profile incrementally — only scan new partitions.
+- **False positive management:** Require N consecutive violations before alerting (avoid flapping). Seasonal adjustments (weekday vs weekend patterns). User feedback loop — mark false positives to improve thresholds. Severity tiers: warning vs critical.
+- **Lineage accuracy:** SQL parsing covers most cases but misses dynamic queries (string-concatenated SQL). Spark plan parsing catches runtime lineage. Combine static (SQL parse) and runtime (plan) for best coverage. Manual annotations for edge cases.
+- **Integration with pipelines:** Embed quality checks as pipeline steps (fail pipeline on critical violations). Gate downstream tasks on upstream quality passing. Publish quality metrics as events for downstream consumers.
+
+**Trade-offs**
+- Proactive (in-pipeline checks) vs Reactive (post-pipeline monitoring): Proactive catches issues before they propagate but adds pipeline latency; reactive is non-blocking but issues may reach downstream before detection.
+- Full scan vs Sampling: Full scan gives exact results but expensive on large tables; sampling is fast but may miss localized issues (e.g., one bad partition).
+- Rule-based vs ML-based anomaly detection: Rules are predictable and explainable but require manual tuning; ML adapts automatically but can be opaque and produce unexpected alerts.
+
+---
+
+### Question 15: Design a Distributed Job Scheduler (Dataproc/YARN-like)
+
+**Requirements**
+- Functional: Accept job submissions (Spark, MapReduce, Hive, Presto). Manage cluster resources (CPU, memory, GPU). Multi-tenant resource isolation with quotas and priorities. Auto-scale clusters based on workload. Support preemptible/spot instances for cost savings. Queue management with fair/capacity scheduling.
+- Non-functional: Schedule jobs within seconds of submission. Support 10K+ concurrent jobs across 1000+ nodes. 99.9% scheduler availability. Efficient resource utilization (>70% cluster utilization).
+- Scale: 1000 nodes, 10K concurrent jobs, 100K cores, 500 TB total memory.
+
+**Estimation**
+```
+Cluster:          1000 nodes × 100 cores × 500 GB mem = 100K cores, 500 TB mem
+Jobs:             10K concurrent, avg 100 tasks each = 1M concurrent tasks
+Scheduling:       1000 scheduling decisions/sec at peak
+Job submission:   ~100 new jobs/min
+Heartbeats:       1000 nodes × 1 heartbeat/3 sec = 333 heartbeats/sec
+State:            1M task states × 500 bytes = 500 MB in-memory
+```
+
+**High-Level Design**
+```
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│   Spark      │  │   Hive       │  │   Presto     │
+│   Driver     │  │   Server     │  │   Coord.     │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       ▼                 ▼                 ▼
+┌─────────────────────────────────────────────────┐
+│           Resource Manager (Master)              │
+│  ┌─────────────┐ ┌────────────┐ ┌────────────┐  │
+│  │  Scheduler  │ │ App Manager│ │ Node Tracker│  │
+│  │ (Fair/FIFO/ │ │ (lifecycle │ │ (health,    │  │
+│  │  Capacity)  │ │  mgmt)     │ │  resources) │  │
+│  └─────────────┘ └────────────┘ └────────────┘  │
+└──────────────────────┬──────────────────────────┘
+                       │
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+    ┌──────────┐ ┌──────────┐ ┌──────────┐
+    │  Node    │ │  Node    │ │  Node    │
+    │ Manager 1│ │ Manager 2│ │ Manager N│
+    │ ┌──┐┌──┐│ │ ┌──┐┌──┐│ │ ┌──┐┌──┐│
+    │ │C1││C2││ │ │C1││C2││ │ │C1││C2││  (Containers)
+    │ └──┘└──┘│ │ └──┘└──┘│ │ └──┘└──┘│
+    └──────────┘ └──────────┘ └──────────┘
+
+Auto-scaler:
+┌─────────────────────┐
+│  Cluster Autoscaler │ ──▶ Cloud API (add/remove nodes)
+│  (metrics-based     │
+│   scaling policy)   │
+└─────────────────────┘
+```
+
+**Key Components**
+
+*Resource Scheduler:*
+- FIFO: Simple queue, first-come-first-served. Starves small jobs behind large ones.
+- Fair Scheduler: Divides resources equally across queues/users. Preempts over-allocated jobs. Ensures all tenants get fair share.
+- Capacity Scheduler: Each queue gets guaranteed capacity percentage. Can borrow from idle queues (elastic). Hierarchical queues (org → team → user).
+
+*Resource Isolation:*
+- Containers: Each task runs in a container with capped CPU/memory. Linux cgroups enforce limits.
+- Queue quotas: Max resources per queue (prevents one team from consuming entire cluster).
+- Preemption: When high-priority job arrives and cluster is full, preempt containers from lower-priority jobs. Preempted tasks are re-queued (requires checkpoint or idempotent tasks).
+
+*Node Management:*
+- Heartbeat: Each node sends heartbeat every 3 sec with resource availability and container status.
+- Health check: Detect unhealthy nodes (high error rate, disk failure, network issues). Mark as decommissioned, reschedule tasks.
+- Node labels: Tag nodes with attributes (SSD, GPU, high-memory). Jobs can request specific labels for placement.
+
+*Auto-scaling:*
+- Scale-up trigger: Pending tasks > threshold for N minutes, or queue wait time > SLA.
+- Scale-down trigger: Node idle for N minutes (no running containers). Graceful decommission — wait for tasks to finish, then remove.
+- Preemptible/Spot instances: Use for fault-tolerant workloads (Spark with checkpointing). Mix on-demand (30% baseline) + spot (70% burst). Handle spot interruption: 2-min warning → checkpoint and migrate tasks.
+
+*Job Lifecycle:*
+```
+submitted → accepted → running → finished/failed/killed
+```
+- Application master: Per-job process that negotiates resources and manages task execution.
+- Speculative execution: If a task is slow (>1.5× median), launch duplicate on another node. Take result from whichever finishes first.
+
+**Deep Dive**
+- **Scheduling at scale:** 1000 scheduling decisions/sec requires efficient data structures. Maintain sorted queue of pending requests. Use node-capacity index for fast matching (which nodes can satisfy a request). Batch scheduling: process multiple requests per scheduling cycle.
+- **Multi-tenancy:** Hierarchical queues map to organization structure. Guaranteed capacity prevents starvation. Elastic sharing borrows idle resources. Preemption policy: configurable (never, within-queue, cross-queue). Fair share calculated recursively through queue hierarchy.
+- **Spot instance management:** Maintain pool of spot instances across multiple instance types/zones (diversification reduces simultaneous interruption). On interruption: gracefully migrate tasks (checkpoint + restart). Track spot pricing and bid strategy. Fallback to on-demand if spot unavailable.
+- **Fault tolerance:** Resource Manager HA: active-standby with ZooKeeper leader election. State persisted to ZooKeeper or DB. On failover, rebuild state from node heartbeats and running applications. Node failure: reschedule all containers from failed node to healthy nodes.
+
+**Trade-offs**
+- Monolithic scheduler vs Two-level (Mesos-style): Monolithic has global view for optimal placement but is a bottleneck at scale; two-level delegates to framework schedulers but can lead to suboptimal global utilization.
+- Fair vs Capacity scheduling: Fair gives equal share and is simpler to reason about; Capacity gives guaranteed minimums with borrowing, better for organizations with defined resource budgets.
+- Eager vs Lazy autoscaling: Eager (scale up quickly, scale down slowly) reduces wait time but wastes money on idle resources; lazy (scale up cautiously) saves money but jobs wait longer. Typical: scale up in 2 min, scale down after 10 min idle.
