@@ -125,6 +125,43 @@ Cache memory: Read QPS × avg_object_size × cache_duration (80/20 rule)
 - **Consistent Hashing** — Maps requests to servers via hash ring. Minimizes redistribution when servers added/removed. Used for cache sharding.
 - **L4 vs L7** — L4 (transport layer, faster, no content inspection) vs L7 (application layer, content-based routing, SSL termination).
 
+**Consistent Hashing Ring Implementation:**
+```python
+class ConsistentHashRing:
+    def __init__(self, nodes=[], vnodes=150):
+        self.vnodes = vnodes  # virtual nodes per physical node
+        self.ring = {}        # hash -> node mapping
+        self.sorted_keys = [] # sorted hash positions
+        for node in nodes:
+            self.add_node(node)
+
+    def _hash(self, key):
+        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+
+    def add_node(self, node):
+        for i in range(self.vnodes):
+            vnode_key = f"{node}:vnode{i}"
+            hash_val = self._hash(vnode_key)
+            self.ring[hash_val] = node
+            bisect.insort(self.sorted_keys, hash_val)
+
+    def remove_node(self, node):
+        for i in range(self.vnodes):
+            vnode_key = f"{node}:vnode{i}"
+            hash_val = self._hash(vnode_key)
+            del self.ring[hash_val]
+            self.sorted_keys.remove(hash_val)
+
+    def get_node(self, key):
+        if not self.ring:
+            return None
+        hash_val = self._hash(key)
+        idx = bisect.bisect_right(self.sorted_keys, hash_val)
+        if idx == len(self.sorted_keys):
+            idx = 0  # wrap around
+        return self.ring[self.sorted_keys[idx]]
+```
+
 ### Message Queues & Event-Driven Architecture
 
 **When to use:**
@@ -146,6 +183,19 @@ Cache memory: Read QPS × avg_object_size × cache_duration (80/20 rule)
 - **Single-leader** — One writer, multiple readers. Simple but leader is bottleneck/SPOF. Failover via leader election.
 - **Multi-leader** — Multiple writers. Better availability but conflict resolution needed (last-write-wins, CRDTs, merge functions).
 - **Leaderless** — Quorum reads/writes (R + W > N). Dynamo-style. No failover needed but more complex.
+
+**Failure Detection & Recovery Protocols:**
+- **Heartbeat Detection:** Node states (ALIVE → SUSPECT after missed heartbeats → DEAD after timeout). Typical: heartbeat every 1s, suspect after 3 missed, dead after 10s.
+- **Phi-Accrual Detector:** Track heartbeat inter-arrival times, compute probability of failure. Adaptive to network conditions. `phi = -log10(P(heartbeat_late))`. Threshold typically 8-12.
+- **Leader Failover Protocol:**
+  1. Followers detect leader timeout (e.g., 10s no heartbeat)
+  2. Follower with highest priority/log position initiates election
+  3. Requests votes from peers (Raft: needs majority)
+  4. Winner becomes leader, broadcasts new term
+  5. Clients redirect to new leader
+- **Read Repair:** On quorum read, if replicas disagree, update stale replicas with latest value
+- **Anti-Entropy:** Background process compares Merkle trees between replicas, syncs differences
+- **Hinted Handoff:** When target node is down, store write as "hint" on another node, deliver when target recovers
 
 ---
 
@@ -177,6 +227,47 @@ Client → API Gateway → Write Service → DB (key-value store)
 - Base62 encoding of auto-increment ID (a-z, A-Z, 0-9): 7 chars = 62^7 ≈ 3.5 trillion combinations
 - Alternatively, hash (MD5/SHA256) of long URL, take first 7 chars. Handle collisions by appending counter.
 - For distributed ID generation: pre-allocate ID ranges to each server, or use Snowflake IDs
+
+**Base62 Encoding Implementation:**
+```python
+CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+def encode_base62(num):
+    if num == 0:
+        return CHARSET[0]
+    result = []
+    while num > 0:
+        result.append(CHARSET[num % 62])
+        num //= 62
+    return ''.join(reversed(result))
+
+def decode_base62(s):
+    num = 0
+    for char in s:
+        num = num * 62 + CHARSET.index(char)
+    return num
+
+# Example: encode_base62(123456789) → "8M0kX"
+# 7 chars supports 62^7 = 3.5 trillion unique URLs
+```
+
+**Distributed ID Generation:**
+```python
+class IDGenerator:
+    def __init__(self, server_id, range_size=10000):
+        self.server_id = server_id
+        self.range_size = range_size
+        self.current_id = None
+        self.range_end = None
+
+    def next_id(self):
+        if self.current_id is None or self.current_id >= self.range_end:
+            # Request new range from coordination service
+            self.current_id, self.range_end = self._allocate_range()
+        id = self.current_id
+        self.current_id += 1
+        return id
+```
 
 *Data Model:*
 ```
@@ -245,6 +336,51 @@ on request:
 Key: rate_limit:{user_id}:{endpoint}
 Value: {tokens: int, last_refill: timestamp}
 Operations: GET + SET with TTL (atomic via Lua script)
+```
+
+**Token Bucket Rate Limiter (Redis Lua Script):**
+```lua
+-- Token Bucket Rate Limiter (atomic Lua script)
+local key = KEYS[1]
+local max_tokens = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])  -- tokens per second
+local now = tonumber(ARGV[3])
+local requested = tonumber(ARGV[4]) or 1
+
+local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
+local tokens = tonumber(bucket[1]) or max_tokens
+local last_refill = tonumber(bucket[2]) or now
+
+-- Refill tokens based on elapsed time
+local elapsed = now - last_refill
+local refill = elapsed * refill_rate
+tokens = math.min(max_tokens, tokens + refill)
+
+-- Check if request can be allowed
+if tokens >= requested then
+    tokens = tokens - requested
+    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+    redis.call('EXPIRE', key, 3600)
+    return {1, tokens}  -- allowed, remaining tokens
+else
+    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+    redis.call('EXPIRE', key, 3600)
+    return {0, tokens}  -- rejected, remaining tokens
+end
+```
+
+**Rate Limiter Usage:**
+```python
+def check_rate_limit(user_id, endpoint, max_tokens=100, refill_rate=10):
+    key = f"ratelimit:{user_id}:{endpoint}"
+    now = time.time()
+    allowed, remaining = redis.eval(LUA_SCRIPT, 1, key, max_tokens, refill_rate, now, 1)
+    return {
+        "allowed": bool(allowed),
+        "X-RateLimit-Remaining": remaining,
+        "X-RateLimit-Limit": max_tokens,
+        "X-RateLimit-Reset": int(now) + int((max_tokens - remaining) / refill_rate)
+    }
 ```
 
 **Deep Dive**
@@ -319,6 +455,41 @@ messages table (Cassandra):
 
 **Deep Dive**
 - **End-to-end encryption:** Signal Protocol. Server stores encrypted blobs, cannot read content. Key exchange on first contact.
+
+**Signal Protocol E2E Encryption Details:**
+
+*Key Types:*
+| Key | Lifetime | Purpose |
+|-----|----------|---------|
+| Identity Key (IK) | Permanent | Long-term identity verification |
+| Signed Pre-Key (SPK) | ~1 month | Medium-term, signed by IK |
+| One-Time Pre-Keys (OPK) | Single use | Prevent replay attacks |
+| Root Key (RK) | Per-conversation | Derives chain keys |
+| Chain Key (CK) | Per-message-batch | Derives message keys |
+| Message Key (MK) | Single message | Encrypts one message (AES-256-GCM) |
+
+*X3DH Key Exchange (first message):*
+```
+Alice (initiator):                    Server:                    Bob (recipient):
+1. Fetch Bob's keys          →        Returns IK_B, SPK_B, OPK_B
+2. Generate ephemeral key EK_A
+3. Compute shared secrets:
+   DH1 = DH(IK_A, SPK_B)     # Alice's identity, Bob's signed pre-key
+   DH2 = DH(EK_A, IK_B)      # Alice's ephemeral, Bob's identity
+   DH3 = DH(EK_A, SPK_B)     # Alice's ephemeral, Bob's signed pre-key
+   DH4 = DH(EK_A, OPK_B)     # Alice's ephemeral, Bob's one-time pre-key
+   SK = KDF(DH1 || DH2 || DH3 || DH4)
+4. Send encrypted message    →        Store for Bob
+5. Bob receives, computes same DH values, derives SK, decrypts
+```
+
+*Double Ratchet (ongoing messages):*
+- **DH Ratchet:** New DH key pair per message batch → forward secrecy
+- **Symmetric Ratchet:** Chain key → message key via KDF → each message has unique key
+- **Result:** Compromise of one key doesn't expose past/future messages
+
+*Server sees only:* sender, recipient, timestamp, encrypted blob (cannot decrypt content)
+
 - **Message ordering:** Snowflake IDs ensure global ordering. Within a conversation, Cassandra clustering key orders by time.
 - **Multi-device sync:** Each device has device_id. Messages delivered to all active devices. Sync cursor per device.
 - **Media:** Upload to object storage (S3), send URL in message. Thumbnail generation via async worker.
@@ -374,6 +545,64 @@ Streaming Path:
 - Each segment available in multiple bitrates
 - Client requests manifest file (HLS .m3u8 or DASH .mpd)
 - Client dynamically selects bitrate per segment based on bandwidth
+
+**HLS Manifest Examples:**
+
+*Master Manifest (.m3u8):*
+```
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+360p/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480
+480p/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+720p/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p/playlist.m3u8
+```
+
+*Media Playlist (720p/playlist.m3u8):*
+```
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:6.0,
+segment_0.ts
+#EXTINF:6.0,
+segment_1.ts
+...
+```
+
+**Bitrate Selection Algorithm:**
+```python
+class ABRController:
+    def __init__(self):
+        self.throughput_history = []  # last N measurements
+        self.buffer_level = 0         # seconds of buffered video
+
+    def select_variant(self, variants, measured_throughput):
+        # Exponential weighted moving average of throughput
+        self.throughput_history.append(measured_throughput)
+        ewma = self._compute_ewma(self.throughput_history, alpha=0.3)
+
+        # Conservative estimate: use 70% of measured throughput
+        safe_bandwidth = ewma * 0.7
+
+        # Buffer-based adjustment
+        if self.buffer_level < 5:      # low buffer: be conservative
+            safe_bandwidth *= 0.5
+        elif self.buffer_level > 30:   # high buffer: can be aggressive
+            safe_bandwidth *= 1.2
+
+        # Select highest variant that fits
+        selected = variants[0]  # lowest quality as fallback
+        for variant in sorted(variants, key=lambda v: v.bandwidth):
+            if variant.bandwidth <= safe_bandwidth:
+                selected = variant
+        return selected
+```
 
 *CDN Strategy:*
 - Serve popular videos from edge caches (80/20 rule)
@@ -453,6 +682,45 @@ feed_cache: user_id → [post_id list ordered by time]
 - Chronological base ordering
 - ML ranking model: engagement prediction (P(like), P(comment), P(share))
 - Features: post age, author relationship strength, content type, user engagement history
+
+**ML Ranking Model Architecture:**
+
+*Two-Stage Architecture:*
+```
+Stage 1: Candidate Retrieval (1000s → 500)
+├── Recent posts from followed users (last 48h)
+├── Trending posts (high engagement velocity)
+└── Collaborative filtering (users similar to you liked this)
+
+Stage 2: Ranking (500 → 50)
+└── Multi-task neural network scores each candidate
+```
+
+*Feature Categories:*
+| Category | Features |
+|----------|----------|
+| User | demographics, past engagement rates, session time, following count |
+| Post | age_minutes, media_type, text_length, creator_follower_count |
+| User-Post | is_following, past_interactions_with_author, topic_affinity |
+| Context | time_of_day, device_type, current_session_depth |
+
+*Multi-Task Ranking Model:*
+```
+Input Features (embeddings + numeric)
+         ↓
+[Shared Dense Layers: 256 → 128 → 64]
+         ↓
+    ┌────┴────┬────────┬────────┬────────┐
+    ↓         ↓        ↓        ↓        ↓
+P(like)  P(comment) P(share) P(save)  P(hide)
+  0.12      0.03      0.01     0.05    0.002
+
+Final Score = w1*P(like) + w2*P(comment) + w3*P(share) + w4*P(save) - w5*P(hide)
+            = 0.4*0.12  + 0.3*0.03    + 0.2*0.01   + 0.2*0.05  - 1.0*0.002
+            = 0.068
+```
+
+*Latency Budget:* Retrieval: 20ms | Ranking: 30ms | Total: <100ms for 50 posts
 
 **Deep Dive**
 - **Fan-out service:** Async via Kafka. On new post, fan-out workers read follower list and write to each follower's feed cache. Batch updates for efficiency.
@@ -831,6 +1099,44 @@ Coordination:
 - Session: Gap-based, per key (close window after N min inactivity)
 - Watermarks: Track event-time progress, trigger window evaluation. Watermark = max_event_time - allowed_lateness.
 
+**Watermark Calculation:**
+
+*Bounded Out-of-Order Watermark:*
+```python
+class BoundedWatermarkGenerator:
+    def __init__(self, max_out_of_order_ms=5000):
+        self.max_out_of_order = max_out_of_order_ms
+        self.max_timestamp_seen = 0
+
+    def on_event(self, event_time):
+        self.max_timestamp_seen = max(self.max_timestamp_seen, event_time)
+
+    def current_watermark(self):
+        # Watermark = max seen timestamp - allowed lateness
+        return self.max_timestamp_seen - self.max_out_of_order
+
+# Example timeline:
+# Event times:  [10:00:01, 10:00:05, 10:00:03, 10:00:08]
+# max_seen:     [10:00:01, 10:00:05, 10:00:05, 10:00:08]
+# watermark:    [09:59:56, 10:00:00, 10:00:00, 10:00:03]  (5s lateness)
+```
+
+*Per-Partition Watermarks (Kafka):*
+```
+Partition 0: watermark = 10:00:03
+Partition 1: watermark = 10:00:07
+Partition 2: watermark = 10:00:01  (slow partition)
+
+Global watermark = min(all partitions) = 10:00:01
+Window [10:00:00-10:00:05] cannot close until slowest partition advances
+```
+
+*Handling Idle Partitions:*
+```python
+if partition.idle_for > idle_timeout:
+    partition.watermark = current_processing_time  # advance artificially
+```
+
 *Exactly-Once Semantics:*
 - Source: Replayable sources (Kafka offsets). On recovery, replay from last committed offset.
 - Internal: Checkpoint barriers flow through the DAG. Aligned barriers ensure consistent snapshots across all operators. On failure, restore state from last checkpoint and replay.
@@ -918,6 +1224,56 @@ Data Sources                        Query Engines
 - Schema evolution: Add/rename/drop columns without rewriting data. Reader handles missing columns with defaults.
 - Time travel: Query data as of any past commit/timestamp. Enabled by retaining old file references in the transaction log.
 - Compaction: Background process merges small files into larger ones. Z-order or Hilbert curve clustering for multi-dimensional query optimization.
+
+**Z-Ordering Algorithm:**
+
+*Z-Value Calculation (bit interleaving):*
+```python
+def z_order_2d(x, y):
+    """Interleave bits of x and y to create Z-value"""
+    z = 0
+    for i in range(16):  # 16 bits per coordinate
+        z |= ((x & (1 << i)) << i) | ((y & (1 << i)) << (i + 1))
+    return z
+
+# Example: x=5 (0101), y=3 (0011)
+# Interleaved: 00_01_11_01 = 0x1D = 29
+# Points close in 2D space have similar Z-values
+```
+
+*Multi-Column Z-Ordering:*
+```python
+def z_order_multi(values, bits_per_col=16):
+    """Z-order for N columns"""
+    z = 0
+    n_cols = len(values)
+    for bit in range(bits_per_col):
+        for col_idx, val in enumerate(values):
+            if val & (1 << bit):
+                z |= 1 << (bit * n_cols + col_idx)
+    return z
+```
+
+*Delta Lake Usage:*
+```sql
+OPTIMIZE my_table
+ZORDER BY (date, user_id, product_id)
+```
+
+*How Data Skipping Works:*
+```
+File 1: date=[2024-01-01, 2024-01-03], user_id=[100, 500]   # Z-values: 0-1000
+File 2: date=[2024-01-01, 2024-01-03], user_id=[501, 900]   # Z-values: 1001-2000
+File 3: date=[2024-01-04, 2024-01-06], user_id=[100, 500]   # Z-values: 2001-3000
+
+Query: WHERE date = '2024-01-02' AND user_id = 250
+→ Only scan File 1 (skip Files 2, 3 based on min/max stats)
+```
+
+*When NOT to use Z-order:*
+- Single-column filters (use regular partitioning instead)
+- Highly skewed columns (one value dominates)
+- Very high cardinality columns (>1M distinct values)
 
 *Metadata Catalog:*
 - Central registry of tables, schemas, partitions, and statistics.
@@ -1020,6 +1376,68 @@ scheduled → queued → running → success/failed/up_for_retry
 - Re-run DAG for historical date range. Creates task instances for each past interval.
 - Respects dependencies. Can run multiple dates in parallel (configurable).
 - Idempotent tasks required — re-execution must produce same result (overwrite partition, upsert by key).
+
+**Backfill Parallelization:**
+
+*Backfill Execution Strategy:*
+```python
+class BackfillController:
+    def __init__(self, dag_id, start_date, end_date, max_parallel=10):
+        self.dag_id = dag_id
+        self.dates = generate_date_range(start_date, end_date)
+        self.max_parallel = max_parallel
+        self.completed = set()
+        self.failed = set()
+
+    def get_next_batch(self):
+        """Return next dates to run, respecting parallelism limit"""
+        pending = [d for d in self.dates
+                   if d not in self.completed and d not in self.failed]
+        # Run oldest dates first (dependencies may exist)
+        pending.sort()
+        return pending[:self.max_parallel]
+
+    def on_complete(self, date, success):
+        if success:
+            self.completed.add(date)
+        else:
+            self.failed.add(date)
+```
+
+*Dependency-Aware Backfill (DAG with dependencies):*
+```
+For each date partition:
+  Task A (date) → Task B (date) → Task C (date)
+
+Execution order (max_parallel=3):
+  Day 1: A    Day 2: A    Day 3: A    (parallel by date, serial within date)
+  Day 1: B    Day 2: B    Day 3: B
+  Day 1: C    Day 2: C    Day 3: C
+```
+
+*Idempotency Patterns:*
+| Pattern | Implementation | Use When |
+|---------|---------------|----------|
+| Partition Overwrite | `INSERT OVERWRITE PARTITION (date='...')` | Partitioned tables |
+| Merge/Upsert | `MERGE INTO ... WHEN MATCHED THEN UPDATE` | Dimension tables |
+| Delete-then-Insert | `DELETE WHERE date=X; INSERT...` | No native MERGE support |
+| Truncate-and-Load | `TRUNCATE TABLE; INSERT...` | Full table refresh |
+
+*Checkpoint/Recovery:*
+```python
+# Save progress to metadata DB
+def checkpoint_state():
+    db.execute("""
+        INSERT INTO backfill_state (dag_id, date, status, completed_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (dag_id, date) DO UPDATE SET status = %s
+    """, (dag_id, date, status, now, status))
+
+# On restart, resume from last checkpoint
+def resume_backfill():
+    completed = db.query("SELECT date FROM backfill_state WHERE status='success'")
+    return [d for d in all_dates if d not in completed]
+```
 
 **Deep Dive**
 - **Dependency management:** Task dependencies within a DAG (upstream/downstream). Cross-DAG dependencies via sensors (poll for external condition) or dataset-triggered DAGs (DAG runs when upstream DAG writes to a dataset).
@@ -1190,6 +1608,87 @@ Auto-scaler:
 - Containers: Each task runs in a container with capped CPU/memory. Linux cgroups enforce limits.
 - Queue quotas: Max resources per queue (prevents one team from consuming entire cluster).
 - Preemption: When high-priority job arrives and cluster is full, preempt containers from lower-priority jobs. Preempted tasks are re-queued (requires checkpoint or idempotent tasks).
+
+**Preemption Strategy:**
+
+*Fair Share Calculation:*
+```python
+def calculate_fair_share(queues, total_resources):
+    """Calculate fair share for each queue based on weight and demand"""
+    total_weight = sum(q.weight for q in queues)
+
+    for queue in queues:
+        queue.fair_share = (queue.weight / total_weight) * total_resources
+        # Constrain by actual demand (don't allocate more than needed)
+        queue.fair_share = min(queue.fair_share, queue.demand)
+
+    # Redistribute unused share to queues with unmet demand
+    redistribute_unused(queues, total_resources)
+```
+
+*Preemption Decision Algorithm:*
+```python
+def should_preempt(queue, cluster_state):
+    """Determine if queue should preempt resources from others"""
+    # Don't preempt if recently preempted (cooldown period)
+    if time_since_last_preempt(queue) < PREEMPTION_COOLDOWN:  # e.g., 30 sec
+        return False
+
+    # Calculate how far below fair share this queue is
+    current_usage = queue.current_allocated
+    shortfall = queue.fair_share - current_usage
+
+    # Only preempt if significantly below fair share (e.g., >10%)
+    if shortfall < queue.fair_share * 0.1:
+        return False
+
+    # Check if there are queues using more than their fair share
+    for other in cluster_state.queues:
+        if other.current_allocated > other.fair_share * 1.1:
+            return True
+    return False
+
+def select_victims(needed_resources, candidate_containers):
+    """Select containers to preempt to free needed resources"""
+    # Sort by: priority (low first), then runtime (short first)
+    candidates = sorted(candidate_containers,
+                       key=lambda c: (c.priority, c.runtime))
+
+    victims = []
+    freed = 0
+    for container in candidates:
+        if freed >= needed_resources:
+            break
+        victims.append(container)
+        freed += container.resources
+    return victims
+```
+
+*Graceful Preemption Process:*
+```
+1. Mark container for preemption
+2. Send SIGTERM to application (allow graceful shutdown)
+3. Wait grace_period (e.g., 30 sec) for checkpoint/cleanup
+4. If still running, send SIGKILL
+5. Release resources, update cluster state
+6. Re-queue preempted task for later execution
+```
+
+*YARN-Style Configuration:*
+```xml
+<property>
+    <name>yarn.scheduler.fair.preemption</name>
+    <value>true</value>
+</property>
+<property>
+    <name>yarn.scheduler.fair.preemption.cluster-utilization-threshold</name>
+    <value>0.8</value>  <!-- Only preempt when cluster >80% utilized -->
+</property>
+<property>
+    <name>yarn.scheduler.fair.waitTimeBeforeKill</name>
+    <value>30000</value>  <!-- 30 sec grace period -->
+</property>
+```
 
 *Node Management:*
 - Heartbeat: Each node sends heartbeat every 3 sec with resource availability and container status.
