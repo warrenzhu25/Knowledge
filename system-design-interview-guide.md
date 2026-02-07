@@ -1043,6 +1043,989 @@ Seed URLs → URL Frontier (priority queue)
 - Bloom filter vs Exact set: Bloom filter uses ~12 GB for 10B URLs (vs 1 TB for hash set); accepts ~1% false positive (skip some valid URLs)
 - Store raw HTML vs Parsed text: Raw is larger but preserves structure for re-processing; parsed is smaller but lossy
 
+---
+
+### 11. Design a Ride-Sharing Service (Uber/Lyft)
+
+**Requirements**
+- Functional: Rider requests ride with pickup/destination; match with nearby driver; real-time tracking; fare calculation; payments; ratings; driver/rider apps
+- Non-functional: Match within 30 seconds; location updates every 3-5 seconds; 99.99% availability; support 20M rides/day; global scale
+- Scale: 20M rides/day, 5M concurrent users, 1M active drivers
+
+**Estimation**
+```
+Rides/day:        20M → 230 rides/sec avg, 1000/sec peak
+Active drivers:   1M sending location every 4 sec → 250K updates/sec
+Location data:    250K × 100 bytes = 25 MB/sec ingestion
+Trip storage:     20M × 2 KB = 40 GB/day
+ETA calculations: 230 × 10 (driver candidates) = 2300 routing requests/sec
+```
+
+**High-Level Design**
+```
+┌─────────────┐     ┌─────────────┐
+│  Rider App  │     │  Driver App │
+└──────┬──────┘     └──────┬──────┘
+       │                   │
+       ▼                   ▼
+┌─────────────────────────────────────────┐
+│              API Gateway                 │
+│  (auth, rate limiting, routing)         │
+└─────────┬─────────────────┬─────────────┘
+          │                 │
+    ┌─────┴─────┐     ┌─────┴─────┐
+    ▼           ▼     ▼           ▼
+┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+│  Trip  │ │Location│ │Matching│ │  Fare  │
+│Service │ │Service │ │Service │ │Service │
+└───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘
+    │          │          │          │
+    ▼          ▼          ▼          ▼
+┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+│Trip DB │ │Location│ │ Driver │ │Pricing │
+│(Postgres│ │ Index  │ │  Pool  │ │ Rules  │
+│/Vitess)│ │(Redis) │ │(Redis) │ │  DB    │
+└────────┘ └────────┘ └────────┘ └────────┘
+
+            ┌──────────────┐
+            │   Kafka      │ → Analytics, ML, Surge Pricing
+            │ (event bus)  │
+            └──────────────┘
+```
+
+**Key Components**
+
+*Location Service & Geospatial Indexing:*
+- Drivers send location every 3-5 seconds via WebSocket/MQTT
+- Store in geospatial index for fast nearest-neighbor queries
+- Options: Redis with Geo commands, custom geohash index, or S2 cells
+
+**Geohash-Based Driver Index:**
+```python
+class DriverLocationIndex:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.precision = 6  # ~1.2km x 0.6km cells
+
+    def update_location(self, driver_id, lat, lng, status='available'):
+        geohash = encode_geohash(lat, lng, self.precision)
+        # Store in sorted set: score = timestamp, enables TTL-based cleanup
+        self.redis.zadd(f"drivers:{geohash}", {driver_id: time.time()})
+        self.redis.hset(f"driver:{driver_id}", mapping={
+            'lat': lat, 'lng': lng, 'status': status, 'geohash': geohash
+        })
+        self.redis.expire(f"driver:{driver_id}", 30)  # TTL for stale drivers
+
+    def find_nearby_drivers(self, lat, lng, radius_km=3, limit=10):
+        center_hash = encode_geohash(lat, lng, self.precision)
+        # Get 9 neighboring cells (center + 8 adjacent)
+        neighbors = get_geohash_neighbors(center_hash)
+
+        candidates = []
+        for gh in neighbors:
+            driver_ids = self.redis.zrange(f"drivers:{gh}", 0, -1)
+            for did in driver_ids:
+                driver = self.redis.hgetall(f"driver:{did}")
+                if driver.get('status') == 'available':
+                    dist = haversine(lat, lng, driver['lat'], driver['lng'])
+                    if dist <= radius_km:
+                        candidates.append((did, dist, driver))
+
+        # Sort by distance, return closest
+        candidates.sort(key=lambda x: x[1])
+        return candidates[:limit]
+```
+
+*Matching Algorithm:*
+```python
+class RideMatchingService:
+    def match_rider_to_driver(self, rider_request):
+        pickup = rider_request.pickup_location
+
+        # 1. Find nearby available drivers (expand radius if needed)
+        for radius in [2, 5, 10]:  # km
+            candidates = location_index.find_nearby_drivers(
+                pickup.lat, pickup.lng, radius, limit=20
+            )
+            if len(candidates) >= 5:
+                break
+
+        if not candidates:
+            return None  # No drivers available
+
+        # 2. Calculate ETA for each candidate (parallel API calls)
+        with ThreadPoolExecutor() as executor:
+            etas = list(executor.map(
+                lambda d: routing_service.get_eta(d.location, pickup),
+                candidates
+            ))
+
+        # 3. Score candidates (ETA + driver rating + acceptance rate)
+        scored = []
+        for driver, eta in zip(candidates, etas):
+            score = (
+                -eta.minutes * 2.0 +           # Lower ETA is better
+                driver.rating * 1.0 +           # Higher rating is better
+                driver.acceptance_rate * 0.5    # Higher acceptance is better
+            )
+            scored.append((driver, eta, score))
+
+        scored.sort(key=lambda x: -x[2])  # Highest score first
+
+        # 4. Dispatch to best driver (with timeout for response)
+        for driver, eta, score in scored:
+            offer = create_ride_offer(rider_request, driver, eta)
+            response = send_offer_with_timeout(driver, offer, timeout=15)
+            if response.accepted:
+                return create_trip(rider_request, driver, eta)
+            # Driver declined or timeout, try next
+
+        return None  # All drivers declined
+```
+
+*Supply Positioning (Driver Demand Heatmap):*
+```python
+class DemandHeatmapService:
+    def __init__(self):
+        self.cell_size = 500  # meters
+        self.history_window = 30  # minutes
+
+    def calculate_demand_heatmap(self, city_bounds):
+        """Predict demand per cell for next 15 minutes"""
+        cells = grid_partition(city_bounds, self.cell_size)
+
+        for cell in cells:
+            # Historical demand (same time, day of week, weather)
+            historical = self.get_historical_demand(cell, lookback_weeks=4)
+            # Recent trend (last 30 min requests in this cell)
+            recent = self.get_recent_requests(cell, self.history_window)
+            # Events (concerts, sports games from calendar API)
+            events = self.get_nearby_events(cell)
+
+            cell.predicted_demand = (
+                0.5 * historical.avg +
+                0.3 * recent.trend +
+                0.2 * events.impact
+            )
+            cell.current_supply = len(self.get_drivers_in_cell(cell))
+            cell.supply_gap = cell.predicted_demand - cell.current_supply
+
+        return cells
+
+    def suggest_driver_repositioning(self, driver):
+        """Suggest where driver should move for higher earnings"""
+        nearby_cells = self.get_cells_within_radius(driver.location, 5)  # 5km
+        # Find undersupplied cells with high demand
+        opportunities = [c for c in nearby_cells if c.supply_gap > 2]
+        opportunities.sort(key=lambda c: -c.supply_gap)
+        return opportunities[:3]
+```
+
+*Surge Pricing:*
+```python
+def calculate_surge_multiplier(cell, current_time):
+    demand = cell.pending_requests  # Unfulfilled requests
+    supply = cell.available_drivers
+
+    if supply == 0:
+        return MAX_SURGE  # e.g., 3.0x
+
+    ratio = demand / supply
+
+    # Tiered surge pricing
+    if ratio < 1.0:
+        return 1.0
+    elif ratio < 1.5:
+        return 1.0 + (ratio - 1.0) * 0.5  # 1.0x - 1.25x
+    elif ratio < 2.0:
+        return 1.25 + (ratio - 1.5) * 0.5  # 1.25x - 1.5x
+    elif ratio < 3.0:
+        return 1.5 + (ratio - 2.0) * 0.5   # 1.5x - 2.0x
+    else:
+        return min(2.0 + (ratio - 3.0) * 0.25, MAX_SURGE)  # Cap at 3.0x
+```
+
+*Fare Calculation:*
+```python
+def calculate_fare(trip):
+    base_fare = city_config.base_fare  # e.g., $2.50
+    per_mile = city_config.per_mile    # e.g., $1.50
+    per_minute = city_config.per_minute  # e.g., $0.25
+    minimum_fare = city_config.minimum  # e.g., $8.00
+
+    distance_fare = trip.distance_miles * per_mile
+    time_fare = trip.duration_minutes * per_minute
+
+    subtotal = base_fare + distance_fare + time_fare
+
+    # Apply surge
+    subtotal *= trip.surge_multiplier
+
+    # Apply promotions/discounts
+    subtotal -= apply_promotions(trip.rider, subtotal)
+
+    # Tolls, airport fees, etc.
+    subtotal += trip.additional_fees
+
+    return max(subtotal, minimum_fare)
+```
+
+**Deep Dive**
+- **Real-time tracking:** WebSocket connection for both rider and driver apps. Location updates published to Kafka topic, consumed by trip tracking service which pushes to connected clients. Fallback to polling if WebSocket disconnects.
+- **Consistency:** Trip state machine (REQUESTED → MATCHED → DRIVER_EN_ROUTE → ARRIVED → IN_PROGRESS → COMPLETED). State transitions are atomic. Optimistic locking prevents double-matching.
+- **High availability:** Stateless services behind load balancer. Redis cluster for location index (replicated). Trip DB uses Vitess or CockroachDB for horizontal scaling. Multi-region deployment with geo-routing.
+- **ETA calculation:** Pre-computed routing tiles for common routes. Real-time traffic overlay from driver GPS traces. Cache ETAs for popular origin-destination pairs. Use OSRM or Valhalla for routing.
+
+**Trade-offs**
+- Push (dispatch to driver) vs Pull (drivers see available rides): Push gives platform control over matching and pricing; pull gives drivers choice but may cause hotspots
+- Exact location vs Cell-based matching: Exact is more accurate but slower (more candidates); cell-based is faster but may miss optimal match
+- Real-time surge vs Smoothed surge: Real-time reacts quickly but causes price volatility; smoothed is fairer but slower to respond to sudden demand
+
+---
+
+### 12. Design a Calendar System (Google Calendar)
+
+**Requirements**
+- Functional: Create/edit/delete events; recurring events; invitations with RSVP; shared calendars; reminders/notifications; find free time across attendees; timezone support; all-day events
+- Non-functional: 99.99% availability; sync across devices in <5 seconds; support 1B users; fast conflict detection
+- Scale: 1B users, 10 events/user/day = 10B events/day read, 100M new events/day
+
+**Estimation**
+```
+Users:              1B total, 100M DAU
+Events:             100B stored events (avg 100 per user)
+New events/day:     100M → 1200/sec
+Event reads/day:    10B → 115K/sec
+Event size:         1 KB average
+Storage:            100B × 1 KB = 100 TB
+Recurring events:   10% of events, expand on read
+```
+
+**High-Level Design**
+```
+┌──────────────────────────────────────────────────────┐
+│  Clients (Web, iOS, Android, Desktop)                │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐                │
+│  │ Web App │ │iOS App  │ │ Android │                │
+│  └────┬────┘ └────┬────┘ └────┬────┘                │
+│       │           │           │                      │
+│       ▼           ▼           ▼                      │
+│  ┌─────────────────────────────────────┐            │
+│  │     Sync Engine (per device)        │            │
+│  │  - Local DB (SQLite/IndexedDB)      │            │
+│  │  - Conflict resolution              │            │
+│  │  - Offline support                  │            │
+│  └─────────────────────────────────────┘            │
+└──────────────────────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────┐
+│                   API Gateway                        │
+└───────────┬─────────────────────────────┬───────────┘
+            │                             │
+            ▼                             ▼
+┌───────────────────┐         ┌───────────────────────┐
+│   Event Service   │         │  Calendar Service     │
+│  - CRUD events    │         │  - Calendar mgmt      │
+│  - Recurrence     │         │  - Sharing/ACL        │
+│  - Reminders      │         │  - Subscriptions      │
+└─────────┬─────────┘         └───────────┬───────────┘
+          │                               │
+          ▼                               ▼
+┌───────────────────┐         ┌───────────────────────┐
+│ Event Store       │         │  Calendar Store       │
+│ (sharded by       │         │  (PostgreSQL)         │
+│  user_id)         │         │                       │
+└───────────────────┘         └───────────────────────┘
+
+┌───────────────────┐         ┌───────────────────────┐
+│ Notification Svc  │         │  Search Service       │
+│ - Email/Push      │         │  (Elasticsearch)      │
+│ - Reminder queue  │         │                       │
+└───────────────────┘         └───────────────────────┘
+```
+
+**Key Components**
+
+*Data Model:*
+```sql
+-- Calendars
+calendars:
+  calendar_id (PK) | owner_id | name | timezone | color | visibility
+
+-- Calendar sharing
+calendar_shares:
+  calendar_id | user_id | permission (owner/editor/viewer)
+
+-- Events (single and recurring master)
+events:
+  event_id (PK) | calendar_id | user_id | title | description
+  | start_time | end_time | timezone | location
+  | recurrence_rule | recurrence_end | is_all_day
+  | created_at | updated_at | etag
+
+-- Recurring event exceptions/modifications
+event_exceptions:
+  event_id | original_start_time | modified_event (JSON) | is_deleted
+
+-- Attendees
+attendees:
+  event_id | user_id | email | response_status (yes/no/maybe/pending)
+  | is_organizer | is_optional
+
+-- Reminders
+reminders:
+  reminder_id | event_id | user_id | minutes_before | method (email/push/sms)
+```
+
+**Recurring Event Handling (RFC 5545 / iCal):**
+```python
+class RecurrenceRule:
+    """Parse and expand RRULE format"""
+    # Example: RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=20251231T235959Z
+
+    def __init__(self, rrule_string):
+        self.freq = None       # DAILY, WEEKLY, MONTHLY, YEARLY
+        self.interval = 1      # Every N freq units
+        self.byday = []        # MO, TU, WE, etc.
+        self.bymonthday = []   # 1-31
+        self.bymonth = []      # 1-12
+        self.until = None      # End date
+        self.count = None      # Max occurrences
+        self._parse(rrule_string)
+
+    def expand(self, start_time, range_start, range_end, exceptions=None):
+        """Generate all occurrences within the given time range"""
+        exceptions = exceptions or {}
+        occurrences = []
+        current = start_time
+        count = 0
+
+        while current <= range_end:
+            if self.until and current > self.until:
+                break
+            if self.count and count >= self.count:
+                break
+
+            if current >= range_start:
+                original_start = current
+                if original_start in exceptions:
+                    exc = exceptions[original_start]
+                    if not exc.is_deleted:
+                        # Modified instance
+                        occurrences.append(exc.modified_event)
+                else:
+                    # Regular instance
+                    occurrences.append(self._create_instance(current))
+
+            current = self._next_occurrence(current)
+            count += 1
+
+        return occurrences
+
+    def _next_occurrence(self, current):
+        if self.freq == 'DAILY':
+            return current + timedelta(days=self.interval)
+        elif self.freq == 'WEEKLY':
+            # Handle BYDAY (e.g., MO,WE,FR)
+            return self._next_weekly(current)
+        elif self.freq == 'MONTHLY':
+            return self._next_monthly(current)
+        elif self.freq == 'YEARLY':
+            return current.replace(year=current.year + self.interval)
+```
+
+**Event Instance Expansion on Query:**
+```python
+def get_events_in_range(user_id, calendar_ids, start, end):
+    events = []
+
+    # 1. Get non-recurring events in range
+    simple_events = db.query("""
+        SELECT * FROM events
+        WHERE calendar_id IN :calendar_ids
+        AND recurrence_rule IS NULL
+        AND start_time < :end AND end_time > :start
+    """, calendar_ids=calendar_ids, start=start, end=end)
+    events.extend(simple_events)
+
+    # 2. Get recurring event masters that might have instances in range
+    recurring_masters = db.query("""
+        SELECT * FROM events
+        WHERE calendar_id IN :calendar_ids
+        AND recurrence_rule IS NOT NULL
+        AND start_time < :end
+        AND (recurrence_end IS NULL OR recurrence_end > :start)
+    """, calendar_ids=calendar_ids, start=start, end=end)
+
+    # 3. Expand each recurring event
+    for master in recurring_masters:
+        exceptions = get_exceptions(master.event_id)
+        rule = RecurrenceRule(master.recurrence_rule)
+        instances = rule.expand(master.start_time, start, end, exceptions)
+        events.extend(instances)
+
+    # 4. Sort by start time
+    events.sort(key=lambda e: e.start_time)
+    return events
+```
+
+**Free/Busy Query (Find Available Time):**
+```python
+class FreeBusyService:
+    def find_free_slots(self, attendee_ids, date, duration_minutes,
+                        working_hours=(9, 17)):
+        """Find available time slots when all attendees are free"""
+        busy_intervals = []
+
+        # Collect busy times for all attendees
+        for user_id in attendee_ids:
+            calendars = get_user_calendars(user_id, include_shared=True)
+            events = get_events_in_range(
+                user_id, calendars,
+                start=date.start_of_day(),
+                end=date.end_of_day()
+            )
+            for event in events:
+                if event.show_as == 'busy':
+                    busy_intervals.append((event.start_time, event.end_time))
+
+        # Merge overlapping intervals
+        merged = merge_intervals(sorted(busy_intervals))
+
+        # Find gaps that fit the required duration
+        free_slots = []
+        day_start = date.replace(hour=working_hours[0])
+        day_end = date.replace(hour=working_hours[1])
+
+        current = day_start
+        for busy_start, busy_end in merged:
+            if current < busy_start:
+                gap_minutes = (busy_start - current).total_seconds() / 60
+                if gap_minutes >= duration_minutes:
+                    free_slots.append((current, busy_start))
+            current = max(current, busy_end)
+
+        # Check time after last busy period
+        if current < day_end:
+            gap_minutes = (day_end - current).total_seconds() / 60
+            if gap_minutes >= duration_minutes:
+                free_slots.append((current, day_end))
+
+        return free_slots
+
+def merge_intervals(intervals):
+    """Merge overlapping time intervals"""
+    if not intervals:
+        return []
+    merged = [intervals[0]]
+    for start, end in intervals[1:]:
+        if start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+```
+
+**Sync Protocol (Incremental Sync):**
+```python
+class CalendarSyncService:
+    def sync(self, user_id, device_id, last_sync_token):
+        """Return changes since last sync"""
+        if last_sync_token is None:
+            # Full sync - return all events
+            events = get_all_user_events(user_id)
+            new_token = generate_sync_token(user_id)
+            return {'events': events, 'sync_token': new_token, 'full_sync': True}
+
+        # Incremental sync - return only changes
+        last_sync_time = decode_sync_token(last_sync_token)
+
+        changes = db.query("""
+            SELECT event_id, updated_at, is_deleted
+            FROM events
+            WHERE user_id = :user_id
+            AND updated_at > :last_sync
+            ORDER BY updated_at
+        """, user_id=user_id, last_sync=last_sync_time)
+
+        updated_events = []
+        deleted_event_ids = []
+
+        for change in changes:
+            if change.is_deleted:
+                deleted_event_ids.append(change.event_id)
+            else:
+                updated_events.append(get_event(change.event_id))
+
+        new_token = generate_sync_token(user_id)
+        return {
+            'updated': updated_events,
+            'deleted': deleted_event_ids,
+            'sync_token': new_token,
+            'full_sync': False
+        }
+```
+
+**Conflict Resolution (Last-Write-Wins with Version):**
+```python
+def update_event(event_id, updates, client_etag):
+    """Update event with optimistic concurrency control"""
+    current = db.get_event(event_id)
+
+    if current.etag != client_etag:
+        # Conflict detected
+        raise ConflictError(
+            message="Event was modified by another client",
+            current_event=current
+        )
+
+    new_etag = generate_etag()
+    updates['etag'] = new_etag
+    updates['updated_at'] = now()
+
+    db.update_event(event_id, updates)
+
+    # Notify other devices of this user
+    push_sync_notification(current.user_id, event_id)
+
+    # Notify attendees if significant change
+    if significant_change(current, updates):
+        notify_attendees(event_id, updates)
+
+    return new_etag
+```
+
+**Deep Dive**
+- **Timezone handling:** Store all times in UTC with IANA timezone identifier. Convert to user's timezone on display. Recurring events store the original timezone — "every Monday 9am Pacific" stays correct even when user travels.
+- **Reminders at scale:** Reminder queue partitioned by fire time (minute buckets). Worker processes reminders for current minute, sends push/email. Handle clock skew with small buffer window.
+- **Invitation flow:** Create event → send invite email → attendee clicks link → update response status → notify organizer. Support external attendees (non-users) via email-only flow.
+- **Sharding strategy:** Shard events by user_id for single-user queries. For shared calendar queries, fan-out to relevant shards or maintain denormalized view.
+
+**Trade-offs**
+- Store expanded instances vs Expand on read: Storing is faster to query but wastes storage and complicates edits; expand on read is flexible but slower for long ranges
+- Push sync vs Pull sync: Push (WebSocket) is real-time but requires connection management; pull (polling) is simpler but higher latency
+- Single event store vs Per-user store: Single is simpler for shared calendars; per-user is faster for personal calendar but requires fan-out for shared
+
+---
+
+### 13. Design a Payment System (Stripe/PayPal)
+
+**Requirements**
+- Functional: Process payments (credit card, bank transfer, wallets); handle refunds; support multiple currencies; recurring billing/subscriptions; payouts to merchants; fraud detection; PCI DSS compliance
+- Non-functional: 99.999% availability for payment processing; exactly-once payment semantics; <500ms payment latency; support $1B/day transaction volume
+- Scale: 10M transactions/day, $1B daily volume, 100K merchants
+
+**Estimation**
+```
+Transactions/day:    10M → 115/sec avg, 500/sec peak
+Transaction size:    $100 average
+Daily volume:        $1B
+Storage per txn:     2 KB (request + response + audit log)
+Storage/year:        10M × 2 KB × 365 = 7 TB
+Ledger entries:      2-4 per transaction (double-entry) = 40M/day
+```
+
+**High-Level Design**
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│  Merchant   │    │  Consumer   │    │   Mobile    │
+│   Website   │    │    App      │    │   Wallet    │
+└──────┬──────┘    └──────┬──────┘    └──────┬──────┘
+       │                  │                  │
+       ▼                  ▼                  ▼
+┌─────────────────────────────────────────────────────┐
+│                    API Gateway                       │
+│  (TLS termination, auth, rate limiting, idempotency)│
+└─────────────────────────┬───────────────────────────┘
+                          │
+         ┌────────────────┼────────────────┐
+         ▼                ▼                ▼
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│  Payment    │   │   Wallet    │   │   Payout    │
+│  Service    │   │   Service   │   │   Service   │
+└──────┬──────┘   └──────┬──────┘   └──────┬──────┘
+       │                 │                 │
+       ▼                 ▼                 ▼
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│   Risk &    │   │   Ledger    │   │   Account   │
+│   Fraud     │   │   Service   │   │   Service   │
+└──────┬──────┘   └─────────────┘   └─────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────┐
+│              Payment Service Provider                │
+│   ┌─────────┐  ┌─────────┐  ┌─────────┐            │
+│   │  Card   │  │  Bank   │  │  Wallet │            │
+│   │ Network │  │ (ACH)   │  │ (PayPal)│            │
+│   │(Visa/MC)│  │         │  │         │            │
+│   └─────────┘  └─────────┘  └─────────┘            │
+└─────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────┐
+│            Data Stores               │
+│  ┌──────────┐  ┌──────────┐         │
+│  │ Payment  │  │  Ledger  │         │
+│  │    DB    │  │    DB    │         │
+│  └──────────┘  └──────────┘         │
+│  ┌──────────┐  ┌──────────┐         │
+│  │  Event   │  │  Audit   │         │
+│  │   Log    │  │   Log    │         │
+│  │ (Kafka)  │  │          │         │
+│  └──────────┘  └──────────┘         │
+└──────────────────────────────────────┘
+```
+
+**Key Components**
+
+*Payment State Machine:*
+```
+     ┌──────────────────────────────────────────────────────────────┐
+     │                                                              │
+     ▼                                                              │
+ CREATED → PROCESSING → AUTHORIZED → CAPTURED → SETTLED            │
+     │         │             │           │          │               │
+     │         │             │           │          └──→ REFUNDED ──┘
+     │         │             │           │                   │
+     │         │             │           └──→ PARTIALLY_REFUNDED
+     │         │             │
+     │         │             └──→ VOIDED
+     │         │
+     │         └──→ DECLINED
+     │
+     └──→ FAILED (validation error)
+```
+
+**Idempotency for Exactly-Once Payments:**
+```python
+class PaymentService:
+    def process_payment(self, request, idempotency_key):
+        """Process payment with exactly-once semantics"""
+        # 1. Check idempotency cache
+        cached = self.idempotency_store.get(idempotency_key)
+        if cached:
+            if cached.status == 'processing':
+                raise PaymentInProgressError("Payment is being processed")
+            return cached.response  # Return cached result
+
+        # 2. Lock the idempotency key
+        lock_acquired = self.idempotency_store.set_if_absent(
+            idempotency_key,
+            {'status': 'processing', 'created_at': now()},
+            ttl=86400  # 24 hours
+        )
+        if not lock_acquired:
+            # Another request beat us
+            return self.process_payment(request, idempotency_key)  # Retry
+
+        try:
+            # 3. Create payment record
+            payment = self.create_payment_record(request)
+
+            # 4. Risk assessment
+            risk_score = self.risk_service.evaluate(payment)
+            if risk_score > RISK_THRESHOLD:
+                payment.status = 'DECLINED'
+                payment.decline_reason = 'high_risk'
+                self.save_and_cache(payment, idempotency_key)
+                return PaymentResponse(payment)
+
+            # 5. Process with payment processor
+            processor_response = self.payment_processor.authorize(payment)
+
+            # 6. Update payment status
+            if processor_response.approved:
+                payment.status = 'AUTHORIZED'
+                payment.authorization_code = processor_response.auth_code
+            else:
+                payment.status = 'DECLINED'
+                payment.decline_reason = processor_response.decline_code
+
+            # 7. Save and cache result
+            self.save_and_cache(payment, idempotency_key)
+
+            # 8. Emit event for downstream services
+            self.event_bus.publish('payment.processed', payment)
+
+            return PaymentResponse(payment)
+
+        except Exception as e:
+            # Mark idempotency key as failed (allow retry)
+            self.idempotency_store.delete(idempotency_key)
+            raise
+
+    def save_and_cache(self, payment, idempotency_key):
+        self.db.save(payment)
+        self.idempotency_store.set(
+            idempotency_key,
+            {'status': 'completed', 'response': payment.to_dict()},
+            ttl=86400
+        )
+```
+
+**Double-Entry Ledger:**
+```python
+class LedgerService:
+    def record_payment(self, payment):
+        """Record payment using double-entry bookkeeping"""
+        entries = []
+
+        # Debit: Customer's liability decreases (they owe less)
+        # Credit: Merchant's receivable increases (they're owed more)
+
+        # Entry 1: Debit Cash/Receivables, Credit Revenue
+        entries.append(LedgerEntry(
+            transaction_id=payment.id,
+            account_id=self.get_cash_account(),
+            entry_type='DEBIT',
+            amount=payment.amount,
+            currency=payment.currency,
+            timestamp=now()
+        ))
+
+        entries.append(LedgerEntry(
+            transaction_id=payment.id,
+            account_id=payment.merchant_account_id,
+            entry_type='CREDIT',
+            amount=payment.amount,
+            currency=payment.currency,
+            timestamp=now()
+        ))
+
+        # Entry 2: Record platform fee
+        if payment.platform_fee > 0:
+            entries.append(LedgerEntry(
+                transaction_id=payment.id,
+                account_id=payment.merchant_account_id,
+                entry_type='DEBIT',
+                amount=payment.platform_fee,
+                currency=payment.currency
+            ))
+            entries.append(LedgerEntry(
+                transaction_id=payment.id,
+                account_id=self.get_platform_revenue_account(),
+                entry_type='CREDIT',
+                amount=payment.platform_fee,
+                currency=payment.currency
+            ))
+
+        # Atomic insert of all entries
+        self.db.batch_insert(entries)
+
+        # Verify debits = credits (invariant check)
+        self.verify_transaction_balance(payment.id)
+
+    def get_account_balance(self, account_id, as_of=None):
+        """Calculate account balance from ledger entries"""
+        as_of = as_of or now()
+        credits = self.db.sum("""
+            SELECT SUM(amount) FROM ledger_entries
+            WHERE account_id = :account_id
+            AND entry_type = 'CREDIT'
+            AND timestamp <= :as_of
+        """, account_id=account_id, as_of=as_of)
+
+        debits = self.db.sum("""
+            SELECT SUM(amount) FROM ledger_entries
+            WHERE account_id = :account_id
+            AND entry_type = 'DEBIT'
+            AND timestamp <= :as_of
+        """, account_id=account_id, as_of=as_of)
+
+        return credits - debits  # For liability/revenue accounts
+```
+
+**Fraud Detection (Real-time Scoring):**
+```python
+class FraudDetectionService:
+    def evaluate(self, payment):
+        """Real-time fraud scoring"""
+        signals = []
+
+        # 1. Velocity checks
+        recent_txns = self.get_recent_transactions(
+            payment.card_fingerprint, hours=24
+        )
+        signals.append(('velocity_24h', len(recent_txns)))
+        signals.append(('amount_24h', sum(t.amount for t in recent_txns)))
+
+        # 2. Geolocation
+        ip_location = self.geoip.lookup(payment.ip_address)
+        card_country = payment.card_country
+        signals.append(('geo_mismatch', ip_location.country != card_country))
+
+        # 3. Device fingerprint
+        device_score = self.device_intelligence.score(payment.device_id)
+        signals.append(('device_risk', device_score))
+
+        # 4. Behavioral analysis
+        user_history = self.get_user_history(payment.user_id)
+        signals.append(('first_purchase', len(user_history) == 0))
+        signals.append(('unusual_amount',
+            payment.amount > user_history.avg_amount * 3))
+
+        # 5. Card BIN analysis
+        bin_info = self.bin_database.lookup(payment.card_bin)
+        signals.append(('prepaid_card', bin_info.is_prepaid))
+        signals.append(('high_risk_country', bin_info.country in HIGH_RISK))
+
+        # 6. ML model prediction
+        ml_score = self.fraud_model.predict(signals)
+        signals.append(('ml_score', ml_score))
+
+        # Combine signals into final score
+        final_score = self.calculate_final_score(signals)
+
+        # Store for model training
+        self.log_evaluation(payment.id, signals, final_score)
+
+        return FraudResult(
+            score=final_score,
+            signals=signals,
+            action=self.recommend_action(final_score)
+        )
+
+    def recommend_action(self, score):
+        if score < 30:
+            return 'APPROVE'
+        elif score < 70:
+            return 'REVIEW'  # Manual review or 3DS challenge
+        else:
+            return 'DECLINE'
+```
+
+**Retry Logic with Exponential Backoff:**
+```python
+class PaymentRetryHandler:
+    def __init__(self):
+        self.max_retries = 3
+        self.base_delay = 1  # seconds
+
+    async def process_with_retry(self, payment):
+        """Retry failed payments with exponential backoff"""
+        last_error = None
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                result = await self.payment_processor.process(payment)
+                return result
+            except RetryableError as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    delay = self.base_delay * (2 ** attempt)  # 1, 2, 4 seconds
+                    delay += random.uniform(0, 1)  # Jitter
+                    await asyncio.sleep(delay)
+                    continue
+            except NonRetryableError as e:
+                # Don't retry: invalid card, insufficient funds, fraud
+                raise
+
+        raise MaxRetriesExceeded(last_error)
+```
+
+**Reconciliation System:**
+```python
+class ReconciliationService:
+    def daily_reconciliation(self, date):
+        """Reconcile internal records with processor settlements"""
+        # 1. Get our internal transactions
+        internal_txns = self.db.query("""
+            SELECT * FROM payments
+            WHERE DATE(created_at) = :date
+            AND status IN ('CAPTURED', 'SETTLED')
+        """, date=date)
+        internal_by_id = {t.processor_txn_id: t for t in internal_txns}
+
+        # 2. Get processor settlement report
+        processor_txns = self.processor.get_settlement_report(date)
+        processor_by_id = {t.id: t for t in processor_txns}
+
+        # 3. Find discrepancies
+        discrepancies = []
+
+        # Transactions in our system but not in processor
+        for txn_id, our_txn in internal_by_id.items():
+            if txn_id not in processor_by_id:
+                discrepancies.append({
+                    'type': 'MISSING_IN_PROCESSOR',
+                    'transaction': our_txn
+                })
+            else:
+                proc_txn = processor_by_id[txn_id]
+                if our_txn.amount != proc_txn.amount:
+                    discrepancies.append({
+                        'type': 'AMOUNT_MISMATCH',
+                        'internal': our_txn,
+                        'processor': proc_txn
+                    })
+
+        # Transactions in processor but not in our system
+        for txn_id, proc_txn in processor_by_id.items():
+            if txn_id not in internal_by_id:
+                discrepancies.append({
+                    'type': 'MISSING_IN_INTERNAL',
+                    'transaction': proc_txn
+                })
+
+        # 4. Generate report and alerts
+        if discrepancies:
+            self.alert_finance_team(discrepancies)
+
+        return ReconciliationReport(
+            date=date,
+            internal_count=len(internal_txns),
+            processor_count=len(processor_txns),
+            discrepancies=discrepancies
+        )
+```
+
+**PCI DSS Compliance Architecture:**
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     PCI DSS Scope Boundary                      │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                Cardholder Data Environment               │  │
+│  │                                                          │  │
+│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │  │
+│  │  │   Card      │    │   Token     │    │   HSM       │  │  │
+│  │  │  Capture    │───▶│   Vault     │───▶│ (encryption)│  │  │
+│  │  │  (iframe)   │    │             │    │             │  │  │
+│  │  └─────────────┘    └──────┬──────┘    └─────────────┘  │  │
+│  │                            │                             │  │
+│  │                            ▼                             │  │
+│  │                     ┌─────────────┐                      │  │
+│  │                     │   Token     │                      │  │
+│  │                     │ (e.g., tok_│                      │  │
+│  │                     │  abc123)   │                      │  │
+│  │                     └─────────────┘                      │  │
+│  │                                                          │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────┘
+                               │
+                               │ Token only (no card data)
+                               ▼
+┌────────────────────────────────────────────────────────────────┐
+│                   Non-PCI Environment                           │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │
+│  │  Payment    │    │   Order     │    │  Merchant   │        │
+│  │  Service    │    │   Service   │    │   Portal    │        │
+│  └─────────────┘    └─────────────┘    └─────────────┘        │
+│                                                                 │
+│  These services only see tokens, never raw card numbers        │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Deep Dive**
+- **Exactly-once semantics:** Idempotency keys stored in Redis with TTL. Before processing, check if key exists. If in-progress, wait and return. If completed, return cached result. If not exists, lock and process. Handle crashes by allowing retry after lock TTL.
+- **Multi-currency:** Store amounts in smallest unit (cents) with currency code. Use exchange rate service for conversion. Lock exchange rate at quote time for consistency. Settlement in merchant's preferred currency.
+- **Subscription billing:** Scheduler triggers recurring charges. Retry failed charges with exponential backoff over 7 days. Notify customer of failures. Dunning management: email → SMS → account suspension.
+- **Disaster recovery:** Active-active across regions. Database with synchronous replication. Payment requests include region affinity. On region failure, DNS failover routes to healthy region.
+
+**Trade-offs**
+- Sync vs Async payment processing: Sync is simpler and gives immediate response; async handles higher throughput but complicates client experience
+- Token vault in-house vs Third-party (Stripe, Braintree): In-house gives more control but requires PCI Level 1 compliance; third-party reduces scope but adds dependency
+- Eventual vs Strong consistency for balance: Strong prevents overdraft but limits throughput; eventual allows higher throughput but needs overdraft handling
+
 ## Section 4: Data Platform Questions
 
 ### Question 11: Design a Stream Processing System (Flink/Spark Streaming)
