@@ -2245,6 +2245,1317 @@ class ReconciliationService:
 - Token vault in-house vs Third-party (Stripe, Braintree): In-house gives more control but requires PCI Level 1 compliance; third-party reduces scope but adds dependency
 - Eventual vs Strong consistency for balance: Strong prevents overdraft but limits throughput; eventual allows higher throughput but needs overdraft handling
 
+---
+
+### 14. Design a Distributed Lock Service (Redlock/Chubby)
+
+**Requirements**
+- Functional: Acquire/release locks by name; lock with TTL (auto-release); blocking and non-blocking acquire; lock extension (renewal); fencing tokens to prevent stale clients
+- Non-functional: High availability (survive node failures); mutual exclusion guarantee; low latency (<10ms acquire); prevent split-brain; handle clock skew
+- Scale: 100K locks, 10K acquire/release per second, 5 nodes for fault tolerance
+
+**Estimation**
+```
+Lock operations:    10K/sec acquire + 10K/sec release = 20K ops/sec
+Active locks:       100K × 100 bytes = 10 MB state
+Replication:        5 nodes, quorum = 3
+Lock TTL:           30 seconds typical, renewal every 10 seconds
+Fencing tokens:     64-bit monotonic counter per lock
+```
+
+**High-Level Design**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Clients                                  │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐            │
+│  │Client 1 │  │Client 2 │  │Client 3 │  │Client N │            │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘            │
+└───────┼───────────┼───────────┼───────────┼────────────────────┘
+        │           │           │           │
+        ▼           ▼           ▼           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Lock Service Cluster                          │
+│                                                                  │
+│   ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐        │
+│   │ Node 1  │   │ Node 2  │   │ Node 3  │   │ Node 4  │  ...   │
+│   │┌───────┐│   │┌───────┐│   │┌───────┐│   │┌───────┐│        │
+│   ││ Locks ││   ││ Locks ││   ││ Locks ││   ││ Locks ││        │
+│   │└───────┘│   │└───────┘│   │└───────┘│   │└───────┘│        │
+│   └─────────┘   └─────────┘   └─────────┘   └─────────┘        │
+│                                                                  │
+│   Consensus: Raft (single leader) OR Redlock (multi-master)     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Components**
+
+*Lock Data Structure:*
+```python
+@dataclass
+class Lock:
+    name: str                    # Lock identifier
+    owner: str                   # Client ID holding the lock
+    token: int                   # Fencing token (monotonic)
+    acquired_at: float           # Timestamp when acquired
+    ttl_ms: int                  # Time-to-live in milliseconds
+
+    def is_expired(self):
+        return time.time() * 1000 > self.acquired_at + self.ttl_ms
+
+    def remaining_ttl(self):
+        return max(0, (self.acquired_at + self.ttl_ms) - time.time() * 1000)
+```
+
+**Single-Node Lock Manager:**
+```python
+class LockManager:
+    def __init__(self):
+        self.locks = {}           # name -> Lock
+        self.token_counter = 0    # Monotonic fencing token generator
+        self.lock = threading.Lock()
+
+    def acquire(self, lock_name, client_id, ttl_ms=30000):
+        """Try to acquire lock, return (success, token, ttl_remaining)"""
+        with self.lock:
+            current = self.locks.get(lock_name)
+
+            # Check if lock exists and is not expired
+            if current and not current.is_expired():
+                if current.owner == client_id:
+                    # Re-entrant: extend TTL, return same token
+                    current.acquired_at = time.time() * 1000
+                    current.ttl_ms = ttl_ms
+                    return True, current.token, ttl_ms
+                else:
+                    # Lock held by another client
+                    return False, None, current.remaining_ttl()
+
+            # Lock available - acquire it
+            self.token_counter += 1
+            new_lock = Lock(
+                name=lock_name,
+                owner=client_id,
+                token=self.token_counter,
+                acquired_at=time.time() * 1000,
+                ttl_ms=ttl_ms
+            )
+            self.locks[lock_name] = new_lock
+            return True, new_lock.token, ttl_ms
+
+    def release(self, lock_name, client_id, token):
+        """Release lock only if caller owns it with correct token"""
+        with self.lock:
+            current = self.locks.get(lock_name)
+            if not current:
+                return True  # Already released
+
+            if current.owner != client_id:
+                return False  # Not the owner
+
+            if current.token != token:
+                return False  # Stale token (lock was re-acquired)
+
+            del self.locks[lock_name]
+            return True
+
+    def extend(self, lock_name, client_id, token, ttl_ms):
+        """Extend lock TTL if caller still owns it"""
+        with self.lock:
+            current = self.locks.get(lock_name)
+            if not current or current.owner != client_id or current.token != token:
+                return False, 0
+
+            if current.is_expired():
+                return False, 0  # Too late, lock expired
+
+            current.acquired_at = time.time() * 1000
+            current.ttl_ms = ttl_ms
+            return True, ttl_ms
+```
+
+**Redlock Algorithm (Distributed, Multi-Master):**
+```python
+class RedlockClient:
+    """
+    Redlock: Acquire lock on majority of independent Redis nodes.
+    Tolerates up to (N-1)/2 node failures.
+    """
+    def __init__(self, nodes, quorum=None):
+        self.nodes = nodes  # List of Redis connections
+        self.quorum = quorum or (len(nodes) // 2 + 1)
+        self.clock_drift_factor = 0.01  # 1% clock drift allowance
+
+    def acquire(self, lock_name, ttl_ms=30000):
+        """
+        Try to acquire lock on majority of nodes.
+        Returns (success, token, valid_until) or (False, None, None)
+        """
+        client_id = str(uuid.uuid4())
+        start_time = time.time() * 1000
+
+        # Try to acquire on all nodes
+        acquired_count = 0
+        for node in self.nodes:
+            try:
+                # SET lock_name client_id NX PX ttl_ms
+                if node.set(lock_name, client_id, nx=True, px=ttl_ms):
+                    acquired_count += 1
+            except Exception:
+                continue  # Node unavailable, skip
+
+        # Calculate elapsed time and remaining validity
+        elapsed = time.time() * 1000 - start_time
+        drift = ttl_ms * self.clock_drift_factor + 2  # Clock drift allowance
+        validity = ttl_ms - elapsed - drift
+
+        # Check if we got quorum and lock is still valid
+        if acquired_count >= self.quorum and validity > 0:
+            return True, client_id, start_time + validity
+
+        # Failed to get quorum - release all acquired locks
+        self._release_all(lock_name, client_id)
+        return False, None, None
+
+    def release(self, lock_name, client_id):
+        """Release lock on all nodes"""
+        self._release_all(lock_name, client_id)
+
+    def _release_all(self, lock_name, client_id):
+        """Release lock on all nodes (only if we own it)"""
+        # Lua script: atomic check-and-delete
+        release_script = """
+        if redis.call("GET", KEYS[1]) == ARGV[1] then
+            return redis.call("DEL", KEYS[1])
+        else
+            return 0
+        end
+        """
+        for node in self.nodes:
+            try:
+                node.eval(release_script, 1, lock_name, client_id)
+            except Exception:
+                continue
+
+    def acquire_with_retry(self, lock_name, ttl_ms=30000,
+                           max_retries=3, retry_delay_ms=200):
+        """Acquire with exponential backoff retry"""
+        for attempt in range(max_retries):
+            success, token, valid_until = self.acquire(lock_name, ttl_ms)
+            if success:
+                return success, token, valid_until
+
+            # Random delay to avoid thundering herd
+            delay = retry_delay_ms * (2 ** attempt) + random.randint(0, 100)
+            time.sleep(delay / 1000)
+
+        return False, None, None
+```
+
+**Fencing Tokens (Prevent Stale Client Writes):**
+```python
+class FencedResource:
+    """
+    Resource that rejects operations from stale lock holders.
+    Fencing token is monotonically increasing - higher token wins.
+    """
+    def __init__(self):
+        self.last_token = 0
+        self.lock = threading.Lock()
+
+    def write(self, data, fencing_token):
+        """
+        Write data only if fencing_token is >= last seen token.
+        Prevents writes from clients whose lock expired and was re-acquired.
+        """
+        with self.lock:
+            if fencing_token < self.last_token:
+                raise StaleTokenError(
+                    f"Token {fencing_token} is stale, current is {self.last_token}"
+                )
+            self.last_token = fencing_token
+            self._do_write(data)
+            return True
+
+# Usage pattern:
+# 1. Acquire lock, get fencing token
+# 2. Pass fencing token to all protected resources
+# 3. Resources reject operations with old tokens
+
+def safe_critical_section(lock_service, resource, lock_name):
+    success, token, valid_until = lock_service.acquire(lock_name)
+    if not success:
+        raise LockNotAcquiredError()
+
+    try:
+        # Token protects against GC pauses, network delays, etc.
+        resource.write({"data": "value"}, fencing_token=token)
+    finally:
+        lock_service.release(lock_name, token)
+```
+
+**Raft-Based Lock Service (Consensus Approach):**
+```python
+class RaftLockService:
+    """
+    Lock service using Raft consensus (like Chubby, etcd, ZooKeeper).
+    Single leader handles all requests - provides linearizable operations.
+    """
+    def __init__(self, raft_cluster):
+        self.raft = raft_cluster  # Raft consensus module
+        self.locks = {}           # Replicated state machine
+        self.sessions = {}        # Client sessions with keepalive
+
+    def acquire(self, session_id, lock_name, ttl_ms):
+        """Acquire lock - must go through Raft log"""
+        if not self.raft.is_leader():
+            # Redirect to leader
+            return self.raft.get_leader().acquire(session_id, lock_name, ttl_ms)
+
+        # Create log entry
+        entry = {
+            'type': 'ACQUIRE',
+            'session_id': session_id,
+            'lock_name': lock_name,
+            'ttl_ms': ttl_ms,
+            'timestamp': time.time()
+        }
+
+        # Replicate through Raft (blocks until committed)
+        result = self.raft.replicate(entry)
+        return result
+
+    def apply(self, entry):
+        """Apply committed log entry to state machine"""
+        if entry['type'] == 'ACQUIRE':
+            return self._apply_acquire(entry)
+        elif entry['type'] == 'RELEASE':
+            return self._apply_release(entry)
+        elif entry['type'] == 'SESSION_EXPIRE':
+            return self._apply_session_expire(entry)
+
+    def _apply_acquire(self, entry):
+        lock_name = entry['lock_name']
+        session_id = entry['session_id']
+
+        current = self.locks.get(lock_name)
+        if current and not current.is_expired():
+            if current.session_id == session_id:
+                # Extend existing lock
+                current.ttl_ms = entry['ttl_ms']
+                current.acquired_at = entry['timestamp']
+                return True, current.token
+            return False, None  # Lock held by another session
+
+        # Grant new lock
+        token = self._next_token()
+        self.locks[lock_name] = Lock(
+            name=lock_name,
+            session_id=session_id,
+            token=token,
+            acquired_at=entry['timestamp'],
+            ttl_ms=entry['ttl_ms']
+        )
+        return True, token
+```
+
+**Lock Client with Auto-Renewal:**
+```python
+class DistributedLockClient:
+    def __init__(self, lock_service, renewal_interval_ms=10000):
+        self.lock_service = lock_service
+        self.renewal_interval = renewal_interval_ms
+        self.active_locks = {}  # lock_name -> (token, renewal_thread)
+
+    def acquire(self, lock_name, ttl_ms=30000, blocking=True, timeout=None):
+        """Acquire lock with automatic renewal"""
+        start = time.time()
+
+        while True:
+            success, token, _ = self.lock_service.acquire(lock_name, ttl_ms)
+
+            if success:
+                # Start renewal thread
+                renewal_thread = threading.Thread(
+                    target=self._renewal_loop,
+                    args=(lock_name, token, ttl_ms),
+                    daemon=True
+                )
+                renewal_thread.start()
+                self.active_locks[lock_name] = (token, renewal_thread)
+                return LockHandle(self, lock_name, token)
+
+            if not blocking:
+                return None
+
+            if timeout and (time.time() - start) > timeout:
+                raise LockTimeoutError(f"Could not acquire {lock_name}")
+
+            time.sleep(0.1)  # Brief sleep before retry
+
+    def _renewal_loop(self, lock_name, token, ttl_ms):
+        """Background thread to renew lock before expiry"""
+        while lock_name in self.active_locks:
+            time.sleep(self.renewal_interval / 1000)
+
+            if lock_name not in self.active_locks:
+                break
+
+            success, _ = self.lock_service.extend(lock_name, token, ttl_ms)
+            if not success:
+                # Lock lost - notify application
+                self._on_lock_lost(lock_name)
+                break
+
+    def release(self, lock_name, token):
+        """Release lock and stop renewal"""
+        if lock_name in self.active_locks:
+            del self.active_locks[lock_name]
+        self.lock_service.release(lock_name, token)
+
+class LockHandle:
+    """Context manager for automatic lock release"""
+    def __init__(self, client, lock_name, token):
+        self.client = client
+        self.lock_name = lock_name
+        self.token = token
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.client.release(self.lock_name, self.token)
+        return False
+
+# Usage:
+# with lock_client.acquire("resource:123") as lock:
+#     do_critical_section()
+```
+
+**Deep Dive**
+- **Clock synchronization:** Redlock assumes bounded clock drift. Use NTP with monitoring. If clock jumps, lock validity may be affected. Conservative TTL helps.
+- **Split-brain prevention:** Quorum ensures at most one client holds lock. With 5 nodes, tolerates 2 failures. With 3 nodes, tolerates 1.
+- **GC pauses:** Client may pause during critical section, lock expires, another client acquires. Fencing tokens protect the resource by rejecting stale writes.
+- **Liveness:** Use TTL to ensure lock is eventually released even if client crashes. Renewal threads extend TTL for long operations.
+
+**Trade-offs**
+- Redlock vs Raft-based: Redlock is simpler (no leader election) but weaker guarantees; Raft provides linearizability but requires leader
+- Short TTL vs Long TTL: Short TTL recovers faster from failures but needs more renewals; long TTL is more resilient to network blips but slower recovery
+- Blocking vs Non-blocking acquire: Blocking is simpler for caller but can cause thread starvation; non-blocking requires caller to handle retry
+
+---
+
+### 15. Design a Proximity Service (Yelp/Find Nearby)
+
+**Requirements**
+- Functional: Find businesses within radius of location; filter by category, rating, price; return sorted by distance or relevance; support 200M businesses globally
+- Non-functional: <100ms latency for nearby search; support 100K QPS; real-time updates for new businesses; global coverage
+- Scale: 200M businesses, 100K searches/sec, 1K business updates/sec
+
+**Estimation**
+```
+Businesses:         200M total, 100 bytes each = 20 GB
+Searches:           100K/sec
+Business updates:   1K/sec (new, edit, delete)
+Geospatial index:   200M points, ~30 GB with indexing overhead
+Typical query:      5km radius, return top 20 results
+```
+
+**High-Level Design**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                          Clients                                 │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       API Gateway                                │
+│              (rate limiting, auth, geo-routing)                  │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+│    Search     │  │   Business    │  │   Location    │
+│   Service     │  │    Service    │  │   Service     │
+│ (nearby query)│  │  (CRUD ops)   │  │ (geocoding)   │
+└───────┬───────┘  └───────┬───────┘  └───────────────┘
+        │                  │
+        ▼                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Geospatial Index                              │
+│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│   │  Geohash    │  │   QuadTree  │  │   Google    │             │
+│   │  (Redis)    │  │  (in-memory)│  │    S2       │             │
+│   └─────────────┘  └─────────────┘  └─────────────┘             │
+└─────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Business Database                             │
+│                (PostgreSQL with PostGIS)                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Components**
+
+*Approach 1: Geohash-Based Indexing:*
+```python
+class GeohashIndex:
+    """
+    Geohash divides Earth into grid cells with hierarchical precision.
+    Nearby points share common prefix in their geohash.
+
+    Precision levels:
+    1: ±2500 km  (5 bits)
+    4: ±20 km    (20 bits)
+    6: ±0.6 km   (30 bits)
+    8: ±19 m     (40 bits)
+    """
+
+    BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz'
+
+    def encode(self, lat, lng, precision=6):
+        """Encode lat/lng to geohash string"""
+        lat_range = (-90.0, 90.0)
+        lng_range = (-180.0, 180.0)
+        geohash = []
+        bits = 0
+        bit = 0
+        ch = 0
+        even = True
+
+        while len(geohash) < precision:
+            if even:  # Longitude
+                mid = (lng_range[0] + lng_range[1]) / 2
+                if lng >= mid:
+                    ch |= (1 << (4 - bit))
+                    lng_range = (mid, lng_range[1])
+                else:
+                    lng_range = (lng_range[0], mid)
+            else:  # Latitude
+                mid = (lat_range[0] + lat_range[1]) / 2
+                if lat >= mid:
+                    ch |= (1 << (4 - bit))
+                    lat_range = (mid, lat_range[1])
+                else:
+                    lat_range = (lat_range[0], mid)
+
+            even = not even
+            bit += 1
+
+            if bit == 5:
+                geohash.append(self.BASE32[ch])
+                bit = 0
+                ch = 0
+
+        return ''.join(geohash)
+
+    def get_neighbors(self, geohash):
+        """Get 8 neighboring geohash cells (for edge cases)"""
+        # Returns adjacent cells: N, NE, E, SE, S, SW, W, NW
+        # Implementation handles wraparound at edges
+        neighbors = []
+        for dlat in [-1, 0, 1]:
+            for dlng in [-1, 0, 1]:
+                if dlat == 0 and dlng == 0:
+                    continue
+                neighbors.append(self._neighbor(geohash, dlat, dlng))
+        return neighbors
+
+class GeohashProximitySearch:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.geohash = GeohashIndex()
+
+    def add_business(self, business_id, lat, lng, data):
+        """Index business by geohash"""
+        # Use precision 6 (~600m cells) for nearby searches
+        gh = self.geohash.encode(lat, lng, precision=6)
+
+        # Store in Redis sorted set (score = geohash prefix for range queries)
+        self.redis.geoadd("businesses:geo", lng, lat, business_id)
+
+        # Also store by geohash prefix for fast lookup
+        self.redis.sadd(f"businesses:geohash:{gh}", business_id)
+
+        # Store business data
+        self.redis.hset(f"business:{business_id}", mapping={
+            'lat': lat, 'lng': lng, 'data': json.dumps(data)
+        })
+
+    def search_nearby(self, lat, lng, radius_km, limit=20):
+        """Find businesses within radius"""
+        # Determine geohash precision based on radius
+        precision = self._radius_to_precision(radius_km)
+        center_hash = self.geohash.encode(lat, lng, precision)
+
+        # Get center cell + neighbors (9 cells total)
+        cells = [center_hash] + self.geohash.get_neighbors(center_hash)
+
+        # Collect candidate businesses from all cells
+        candidates = []
+        for cell in cells:
+            # Get all businesses in this cell
+            business_ids = self.redis.smembers(f"businesses:geohash:{cell}")
+            for bid in business_ids:
+                biz = self.redis.hgetall(f"business:{bid}")
+                candidates.append((bid, float(biz['lat']), float(biz['lng'])))
+
+        # Filter by exact distance and sort
+        results = []
+        for bid, blat, blng in candidates:
+            dist = self._haversine(lat, lng, blat, blng)
+            if dist <= radius_km:
+                results.append((bid, dist))
+
+        results.sort(key=lambda x: x[1])
+        return results[:limit]
+
+    def _haversine(self, lat1, lng1, lat2, lng2):
+        """Calculate distance between two points in km"""
+        R = 6371  # Earth's radius in km
+        dlat = math.radians(lat2 - lat1)
+        dlng = math.radians(lng2 - lng1)
+        a = (math.sin(dlat/2)**2 +
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+             math.sin(dlng/2)**2)
+        c = 2 * math.asin(math.sqrt(a))
+        return R * c
+
+    def _radius_to_precision(self, radius_km):
+        """Choose geohash precision based on search radius"""
+        if radius_km > 100:
+            return 3   # ~78km cells
+        elif radius_km > 10:
+            return 4   # ~20km cells
+        elif radius_km > 1:
+            return 5   # ~2.4km cells
+        else:
+            return 6   # ~0.6km cells
+```
+
+*Approach 2: QuadTree (In-Memory):*
+```python
+class QuadTree:
+    """
+    Recursively divide 2D space into 4 quadrants.
+    Each node holds points until capacity, then splits.
+
+    Good for: non-uniform distribution, dynamic updates
+    Query time: O(log n) average
+    """
+
+    def __init__(self, boundary, capacity=4):
+        self.boundary = boundary  # (x, y, width, height)
+        self.capacity = capacity
+        self.points = []          # [(id, x, y, data), ...]
+        self.divided = False
+        self.nw = self.ne = self.sw = self.se = None
+
+    def insert(self, point_id, x, y, data=None):
+        """Insert a point into the quadtree"""
+        if not self._contains(x, y):
+            return False
+
+        if len(self.points) < self.capacity and not self.divided:
+            self.points.append((point_id, x, y, data))
+            return True
+
+        if not self.divided:
+            self._subdivide()
+
+        # Insert into appropriate quadrant
+        return (self.nw.insert(point_id, x, y, data) or
+                self.ne.insert(point_id, x, y, data) or
+                self.sw.insert(point_id, x, y, data) or
+                self.se.insert(point_id, x, y, data))
+
+    def _subdivide(self):
+        """Split node into 4 quadrants"""
+        x, y, w, h = self.boundary
+        hw, hh = w / 2, h / 2
+
+        self.nw = QuadTree((x, y + hh, hw, hh), self.capacity)
+        self.ne = QuadTree((x + hw, y + hh, hw, hh), self.capacity)
+        self.sw = QuadTree((x, y, hw, hh), self.capacity)
+        self.se = QuadTree((x + hw, y, hw, hh), self.capacity)
+        self.divided = True
+
+        # Re-insert existing points into children
+        for pid, px, py, data in self.points:
+            self._insert_into_children(pid, px, py, data)
+        self.points = []
+
+    def query_radius(self, cx, cy, radius):
+        """Find all points within radius of (cx, cy)"""
+        results = []
+        self._query_radius(cx, cy, radius, results)
+        return results
+
+    def _query_radius(self, cx, cy, radius, results):
+        """Recursive radius query"""
+        # Skip if this quadrant doesn't intersect the search circle
+        if not self._intersects_circle(cx, cy, radius):
+            return
+
+        # Check points in this node
+        for pid, px, py, data in self.points:
+            dist = math.sqrt((px - cx)**2 + (py - cy)**2)
+            if dist <= radius:
+                results.append((pid, px, py, dist, data))
+
+        # Recurse into children
+        if self.divided:
+            self.nw._query_radius(cx, cy, radius, results)
+            self.ne._query_radius(cx, cy, radius, results)
+            self.sw._query_radius(cx, cy, radius, results)
+            self.se._query_radius(cx, cy, radius, results)
+
+    def _intersects_circle(self, cx, cy, radius):
+        """Check if this quadrant intersects the search circle"""
+        x, y, w, h = self.boundary
+        # Find closest point on rectangle to circle center
+        closest_x = max(x, min(cx, x + w))
+        closest_y = max(y, min(cy, y + h))
+        dist = math.sqrt((closest_x - cx)**2 + (closest_y - cy)**2)
+        return dist <= radius
+
+    def _contains(self, x, y):
+        bx, by, w, h = self.boundary
+        return bx <= x < bx + w and by <= y < by + h
+
+class QuadTreeProximityService:
+    def __init__(self):
+        # Cover entire world: lng [-180, 180], lat [-90, 90]
+        self.tree = QuadTree((-180, -90, 360, 180), capacity=100)
+        self.businesses = {}  # id -> full business data
+
+    def add_business(self, business):
+        self.businesses[business.id] = business
+        # Note: QuadTree uses flat coordinates; for accuracy,
+        # convert to projected coordinates or use haversine for distance
+        self.tree.insert(business.id, business.lng, business.lat, None)
+
+    def search_nearby(self, lat, lng, radius_km, filters=None, limit=20):
+        # Convert km to degrees (approximate)
+        radius_deg = radius_km / 111.0  # 1 degree ≈ 111 km
+
+        candidates = self.tree.query_radius(lng, lat, radius_deg)
+
+        # Apply filters and calculate exact distance
+        results = []
+        for pid, px, py, _, _ in candidates:
+            biz = self.businesses[pid]
+
+            # Apply filters
+            if filters:
+                if not self._matches_filters(biz, filters):
+                    continue
+
+            # Calculate exact distance using haversine
+            dist = self._haversine(lat, lng, biz.lat, biz.lng)
+            if dist <= radius_km:
+                results.append((biz, dist))
+
+        # Sort by distance
+        results.sort(key=lambda x: x[1])
+        return results[:limit]
+```
+
+*Approach 3: Google S2 Cells:*
+```python
+class S2ProximitySearch:
+    """
+    S2 Geometry: Projects Earth onto a cube, then uses Hilbert curve
+    for 1D ordering. Provides tight covering of arbitrary regions.
+
+    Advantages over geohash:
+    - No discontinuities at edges
+    - Better coverage of polar regions
+    - Variable-size cells for efficient covering
+    """
+
+    def __init__(self, db):
+        self.db = db  # Database with S2 cell index
+
+    def search_nearby(self, lat, lng, radius_km, limit=20):
+        # Create S2 point for center
+        center = s2.S2LatLng.FromDegrees(lat, lng).ToPoint()
+
+        # Create spherical cap (circle on sphere)
+        radius_radians = radius_km / 6371.0  # Earth radius in km
+        cap = s2.S2Cap.FromCenterAngle(center, s2.S1Angle.Radians(radius_radians))
+
+        # Get covering cells at appropriate level
+        coverer = s2.S2RegionCoverer()
+        coverer.set_max_cells(20)        # Limit cell count for query efficiency
+        coverer.set_min_level(10)         # ~10km cells
+        coverer.set_max_level(16)         # ~150m cells
+
+        covering = coverer.GetCovering(cap)
+
+        # Query database for each covering cell
+        candidates = []
+        for cell_id in covering:
+            # Range query: all cells that start with this prefix
+            cell_range = self._get_cell_range(cell_id)
+            results = self.db.query(
+                "SELECT * FROM businesses WHERE s2_cell BETWEEN ? AND ?",
+                cell_range
+            )
+            candidates.extend(results)
+
+        # Filter by exact distance
+        results = []
+        for biz in candidates:
+            dist = self._haversine(lat, lng, biz.lat, biz.lng)
+            if dist <= radius_km:
+                results.append((biz, dist))
+
+        results.sort(key=lambda x: x[1])
+        return results[:limit]
+
+    def add_business(self, business):
+        # Calculate S2 cell at leaf level (level 30)
+        point = s2.S2LatLng.FromDegrees(business.lat, business.lng)
+        cell = s2.S2CellId.FromLatLng(point)
+
+        # Store with cell ID for range queries
+        self.db.insert(
+            "INSERT INTO businesses (id, lat, lng, s2_cell, data) VALUES (?, ?, ?, ?, ?)",
+            (business.id, business.lat, business.lng, cell.id(), business.data)
+        )
+```
+
+**Sharding Strategy:**
+```python
+class ShardedProximityService:
+    """
+    Shard businesses by geographic region for horizontal scaling.
+    Each shard handles a contiguous region (e.g., city, country).
+    """
+
+    def __init__(self, shards):
+        # shards: {region_id: (geohash_prefix, shard_connection)}
+        self.shards = shards
+        self.region_index = self._build_region_index()
+
+    def search_nearby(self, lat, lng, radius_km, limit=20):
+        # Determine which shards to query
+        center_geohash = encode_geohash(lat, lng, precision=2)  # ~600km
+        relevant_shards = self._get_shards_for_region(center_geohash, radius_km)
+
+        # Query all relevant shards in parallel
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for shard in relevant_shards:
+                futures.append(
+                    executor.submit(shard.search_nearby, lat, lng, radius_km, limit)
+                )
+
+            # Merge results
+            all_results = []
+            for future in futures:
+                all_results.extend(future.result())
+
+        # Sort merged results by distance
+        all_results.sort(key=lambda x: x[1])
+        return all_results[:limit]
+
+    def _get_shards_for_region(self, center_geohash, radius_km):
+        """Find all shards that may contain results"""
+        shards = set()
+        shards.add(self.region_index[center_geohash])
+
+        # If radius is large, include neighboring regions
+        if radius_km > 50:  # Crosses region boundaries
+            for neighbor in get_geohash_neighbors(center_geohash):
+                if neighbor in self.region_index:
+                    shards.add(self.region_index[neighbor])
+
+        return list(shards)
+```
+
+**Deep Dive**
+- **Index choice:** Geohash is simple and works well with Redis/DB range queries. QuadTree is better for in-memory with non-uniform distribution. S2 is most accurate for spherical geometry and used by Google.
+- **Caching:** Cache popular location queries (city centers, airports). Use geohash as cache key. Invalidate on nearby business updates.
+- **Real-time updates:** For 1K updates/sec, use write-through to update index. Batch updates for efficiency. Eventually consistent is usually acceptable.
+- **Ranking:** Combine distance with rating, review count, and user preferences. Personalization based on past behavior.
+
+**Trade-offs**
+- Geohash vs QuadTree vs S2: Geohash is simplest with DB integration; QuadTree handles non-uniform distribution; S2 is most accurate but complex
+- In-memory vs Database index: In-memory (QuadTree) is faster but limited by RAM; DB index (PostGIS, Redis Geo) scales better but slower
+- Fixed grid vs Dynamic: Fixed grid (geohash) is simpler; dynamic (QuadTree) adapts to density but harder to distribute
+
+---
+
+### 16. Design a Unique ID Generator (Snowflake)
+
+**Requirements**
+- Functional: Generate globally unique 64-bit IDs; IDs should be roughly time-ordered; no coordination between generators; support 10K+ IDs per second per node
+- Non-functional: High availability (no SPOF); low latency (<1ms); unique across data centers; survive clock skew
+- Scale: 1000 nodes, 10M IDs/sec total, multi-datacenter
+
+**Estimation**
+```
+ID rate:            10M/sec globally, 10K/sec per node
+Nodes:              1000 generators
+Bits available:     64 bits total
+Time precision:     Millisecond (need ~41 bits for 69 years)
+Sequence:           4096 per millisecond per node (12 bits)
+Node ID:            1024 nodes (10 bits)
+```
+
+**High-Level Design**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Snowflake ID Structure                       │
+│                         (64 bits)                                │
+│                                                                  │
+│  ┌───┬────────────────────────┬──────────┬─────────────────┐    │
+│  │ 0 │      Timestamp         │  Node ID │    Sequence     │    │
+│  │   │     (41 bits)          │ (10 bits)│    (12 bits)    │    │
+│  │ 1 │                        │          │                 │    │
+│  │bit│   69 years of ms       │  1024    │  4096 per ms    │    │
+│  └───┴────────────────────────┴──────────┴─────────────────┘    │
+│                                                                  │
+│  Example: 0 | 1704067200000 | 42 | 1234                         │
+│  Binary:  0 | 41 bits       | 10 | 12 bits                      │
+└─────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│                    Deployment                                 │
+│                                                              │
+│   ┌───────────────┐    ┌───────────────┐                    │
+│   │  Datacenter 1 │    │  Datacenter 2 │                    │
+│   │ ┌───────────┐ │    │ ┌───────────┐ │                    │
+│   │ │ Node 0-99 │ │    │ │Node 100-199│                    │
+│   │ │ Generator │ │    │ │ Generator │ │                    │
+│   │ └───────────┘ │    │ └───────────┘ │                    │
+│   └───────────────┘    └───────────────┘                    │
+│                                                              │
+│   Node IDs assigned at deployment (static or via ZooKeeper) │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Key Components**
+
+**Snowflake ID Generator:**
+```python
+class SnowflakeGenerator:
+    """
+    Twitter Snowflake-style 64-bit ID generator.
+
+    Bit allocation:
+    - 1 bit:  Sign (always 0 for positive)
+    - 41 bits: Timestamp (milliseconds since custom epoch)
+    - 10 bits: Node/Machine ID (0-1023)
+    - 12 bits: Sequence number (0-4095 per millisecond)
+
+    Properties:
+    - Time-ordered: IDs generated later have higher values
+    - Unique: Node ID + sequence ensures uniqueness within millisecond
+    - No coordination: Each node generates independently
+    """
+
+    # Custom epoch: 2020-01-01 00:00:00 UTC
+    EPOCH = 1577836800000
+
+    # Bit lengths
+    TIMESTAMP_BITS = 41
+    NODE_ID_BITS = 10
+    SEQUENCE_BITS = 12
+
+    # Max values
+    MAX_NODE_ID = (1 << NODE_ID_BITS) - 1      # 1023
+    MAX_SEQUENCE = (1 << SEQUENCE_BITS) - 1     # 4095
+
+    # Bit shifts
+    TIMESTAMP_SHIFT = NODE_ID_BITS + SEQUENCE_BITS  # 22
+    NODE_ID_SHIFT = SEQUENCE_BITS                    # 12
+
+    def __init__(self, node_id):
+        if node_id < 0 or node_id > self.MAX_NODE_ID:
+            raise ValueError(f"Node ID must be between 0 and {self.MAX_NODE_ID}")
+
+        self.node_id = node_id
+        self.sequence = 0
+        self.last_timestamp = -1
+        self.lock = threading.Lock()
+
+    def generate(self):
+        """Generate next unique ID"""
+        with self.lock:
+            timestamp = self._current_time_ms()
+
+            if timestamp < self.last_timestamp:
+                # Clock moved backwards - this is a problem!
+                raise ClockMovedBackwardsError(
+                    f"Clock moved backwards by {self.last_timestamp - timestamp}ms"
+                )
+
+            if timestamp == self.last_timestamp:
+                # Same millisecond - increment sequence
+                self.sequence = (self.sequence + 1) & self.MAX_SEQUENCE
+
+                if self.sequence == 0:
+                    # Sequence exhausted for this millisecond - wait for next ms
+                    timestamp = self._wait_next_millis(self.last_timestamp)
+            else:
+                # New millisecond - reset sequence
+                self.sequence = 0
+
+            self.last_timestamp = timestamp
+
+            # Compose the 64-bit ID
+            id = ((timestamp - self.EPOCH) << self.TIMESTAMP_SHIFT) | \
+                 (self.node_id << self.NODE_ID_SHIFT) | \
+                 self.sequence
+
+            return id
+
+    def _current_time_ms(self):
+        return int(time.time() * 1000)
+
+    def _wait_next_millis(self, last_timestamp):
+        """Spin until clock advances to next millisecond"""
+        timestamp = self._current_time_ms()
+        while timestamp <= last_timestamp:
+            timestamp = self._current_time_ms()
+        return timestamp
+
+    def parse(self, id):
+        """Extract components from a Snowflake ID"""
+        timestamp = ((id >> self.TIMESTAMP_SHIFT) & ((1 << self.TIMESTAMP_BITS) - 1))
+        timestamp += self.EPOCH
+
+        node_id = (id >> self.NODE_ID_SHIFT) & self.MAX_NODE_ID
+        sequence = id & self.MAX_SEQUENCE
+
+        return {
+            'timestamp': timestamp,
+            'datetime': datetime.fromtimestamp(timestamp / 1000),
+            'node_id': node_id,
+            'sequence': sequence
+        }
+```
+
+**Handling Clock Skew:**
+```python
+class RobustSnowflakeGenerator:
+    """
+    Enhanced Snowflake with clock skew handling.
+    """
+
+    def __init__(self, node_id, max_clock_skew_ms=5000):
+        self.node_id = node_id
+        self.max_clock_skew_ms = max_clock_skew_ms
+        self.sequence = 0
+        self.last_timestamp = -1
+        self.lock = threading.Lock()
+
+    def generate(self):
+        with self.lock:
+            timestamp = self._current_time_ms()
+
+            if timestamp < self.last_timestamp:
+                skew = self.last_timestamp - timestamp
+
+                if skew <= self.max_clock_skew_ms:
+                    # Small skew: wait it out
+                    time.sleep(skew / 1000.0)
+                    timestamp = self._current_time_ms()
+                else:
+                    # Large skew: something seriously wrong
+                    raise ClockSkewTooLargeError(f"Clock skew of {skew}ms exceeds max")
+
+            # Rest of generation logic...
+            if timestamp == self.last_timestamp:
+                self.sequence = (self.sequence + 1) & SnowflakeGenerator.MAX_SEQUENCE
+                if self.sequence == 0:
+                    timestamp = self._wait_next_millis(self.last_timestamp)
+            else:
+                self.sequence = 0
+
+            self.last_timestamp = timestamp
+
+            return self._compose_id(timestamp, self.node_id, self.sequence)
+
+class LogicalClockSnowflake:
+    """
+    Alternative: Use logical timestamp that never goes backwards.
+    Trade-off: IDs may drift from wall clock during skew.
+    """
+
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.sequence = 0
+        self.logical_time = self._current_time_ms()
+        self.lock = threading.Lock()
+
+    def generate(self):
+        with self.lock:
+            wall_time = self._current_time_ms()
+
+            # Logical time = max(wall_time, last_logical_time)
+            self.logical_time = max(wall_time, self.logical_time)
+
+            self.sequence = (self.sequence + 1) & SnowflakeGenerator.MAX_SEQUENCE
+            if self.sequence == 0:
+                # Force logical time forward
+                self.logical_time += 1
+
+            return self._compose_id(self.logical_time, self.node_id, self.sequence)
+```
+
+**Node ID Assignment:**
+```python
+class NodeIDAssigner:
+    """
+    Strategies for assigning unique node IDs:
+    1. Static configuration (simplest, requires manual management)
+    2. ZooKeeper-based (automatic, survives restarts)
+    3. Database-based (simple coordination)
+    """
+
+    # Strategy 1: Static from config/environment
+    @staticmethod
+    def from_config():
+        return int(os.environ['SNOWFLAKE_NODE_ID'])
+
+    # Strategy 2: ZooKeeper ephemeral sequential nodes
+    @staticmethod
+    def from_zookeeper(zk_client, service_name):
+        """
+        Create ephemeral sequential node in ZooKeeper.
+        Node ID = sequence number from ZK path.
+        """
+        path = f"/snowflake/{service_name}/nodes/node-"
+        created_path = zk_client.create(
+            path,
+            ephemeral=True,
+            sequence=True
+        )
+        # Extract sequence number: /snowflake/svc/nodes/node-0000000042 -> 42
+        node_id = int(created_path.split('-')[-1])
+
+        if node_id > SnowflakeGenerator.MAX_NODE_ID:
+            raise TooManyNodesError(f"Node ID {node_id} exceeds max")
+
+        return node_id
+
+    # Strategy 3: Database with lease
+    @staticmethod
+    def from_database(db, hostname, lease_duration_sec=300):
+        """
+        Claim a node ID from database with time-based lease.
+        """
+        # Try to claim an existing expired lease
+        result = db.execute("""
+            UPDATE node_leases
+            SET hostname = ?,
+                lease_until = NOW() + INTERVAL ? SECOND
+            WHERE lease_until < NOW()
+            ORDER BY node_id
+            LIMIT 1
+            RETURNING node_id
+        """, (hostname, lease_duration_sec))
+
+        if result:
+            return result['node_id']
+
+        # No expired leases - create new one if under limit
+        result = db.execute("""
+            INSERT INTO node_leases (hostname, lease_until)
+            SELECT ?, NOW() + INTERVAL ? SECOND
+            WHERE (SELECT COUNT(*) FROM node_leases) < 1024
+            RETURNING node_id
+        """, (hostname, lease_duration_sec))
+
+        if result:
+            return result['node_id']
+
+        raise NoNodeIDAvailableError("All 1024 node IDs are in use")
+```
+
+**Datacenter-Aware Snowflake:**
+```python
+class DatacenterSnowflake:
+    """
+    Split node ID bits between datacenter and machine.
+
+    Bit allocation:
+    - 41 bits: Timestamp
+    - 5 bits:  Datacenter ID (0-31)
+    - 5 bits:  Machine ID (0-31 per datacenter)
+    - 12 bits: Sequence
+
+    Total: 32 datacenters × 32 machines = 1024 nodes
+    """
+
+    DATACENTER_BITS = 5
+    MACHINE_BITS = 5
+    SEQUENCE_BITS = 12
+
+    MAX_DATACENTER_ID = (1 << DATACENTER_BITS) - 1  # 31
+    MAX_MACHINE_ID = (1 << MACHINE_BITS) - 1        # 31
+    MAX_SEQUENCE = (1 << SEQUENCE_BITS) - 1          # 4095
+
+    def __init__(self, datacenter_id, machine_id):
+        if datacenter_id > self.MAX_DATACENTER_ID:
+            raise ValueError(f"Datacenter ID must be <= {self.MAX_DATACENTER_ID}")
+        if machine_id > self.MAX_MACHINE_ID:
+            raise ValueError(f"Machine ID must be <= {self.MAX_MACHINE_ID}")
+
+        self.datacenter_id = datacenter_id
+        self.machine_id = machine_id
+        self.sequence = 0
+        self.last_timestamp = -1
+        self.lock = threading.Lock()
+
+    def generate(self):
+        with self.lock:
+            timestamp = self._current_time_ms()
+
+            if timestamp == self.last_timestamp:
+                self.sequence = (self.sequence + 1) & self.MAX_SEQUENCE
+                if self.sequence == 0:
+                    timestamp = self._wait_next_millis(timestamp)
+            else:
+                self.sequence = 0
+
+            self.last_timestamp = timestamp
+
+            # Compose ID with datacenter and machine
+            id = ((timestamp - self.EPOCH) << 22) | \
+                 (self.datacenter_id << 17) | \
+                 (self.machine_id << 12) | \
+                 self.sequence
+
+            return id
+```
+
+**Alternative: ULID (Lexicographically Sortable):**
+```python
+class ULIDGenerator:
+    """
+    ULID: Universally Unique Lexicographically Sortable Identifier
+
+    Format: 26 characters, Crockford Base32 encoded
+    - 48 bits: Timestamp (milliseconds, good for 10889 years)
+    - 80 bits: Randomness
+
+    Properties:
+    - Lexicographically sortable (can use string comparison)
+    - Case insensitive
+    - No special characters (URL safe)
+    - 128 bits total (same as UUID)
+
+    Trade-off vs Snowflake:
+    - ULID: No node ID needed, but randomness means tiny collision risk
+    - Snowflake: Guaranteed unique, but requires node ID management
+    """
+
+    ENCODING = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford Base32
+
+    def __init__(self):
+        self.last_time = 0
+        self.random_bits = 0
+        self.lock = threading.Lock()
+
+    def generate(self):
+        with self.lock:
+            now = int(time.time() * 1000)
+
+            if now == self.last_time:
+                # Same millisecond - increment random portion
+                self.random_bits += 1
+                if self.random_bits > (1 << 80) - 1:
+                    # Overflow - wait for next millisecond
+                    while int(time.time() * 1000) == now:
+                        pass
+                    now = int(time.time() * 1000)
+                    self.random_bits = random.getrandbits(80)
+            else:
+                # New millisecond - generate new random bits
+                self.random_bits = random.getrandbits(80)
+
+            self.last_time = now
+
+            return self._encode(now, self.random_bits)
+
+    def _encode(self, timestamp, random_bits):
+        """Encode to 26-character Crockford Base32 string"""
+        # 10 chars for timestamp (48 bits)
+        # 16 chars for randomness (80 bits)
+        result = []
+
+        # Encode timestamp (48 bits = 10 chars × 5 bits, with 2 bits padding)
+        for i in range(9, -1, -1):
+            result.append(self.ENCODING[(timestamp >> (i * 5)) & 0x1F])
+
+        # Encode randomness (80 bits = 16 chars × 5 bits)
+        for i in range(15, -1, -1):
+            result.append(self.ENCODING[(random_bits >> (i * 5)) & 0x1F])
+
+        return ''.join(result)
+```
+
+**ID Generator Service:**
+```python
+class IDGeneratorService:
+    """
+    HTTP service wrapper for Snowflake generator.
+    Supports batch generation for efficiency.
+    """
+
+    def __init__(self, node_id):
+        self.generator = SnowflakeGenerator(node_id)
+        self.batch_cache = queue.Queue(maxsize=1000)
+        self._start_batch_generator()
+
+    def _start_batch_generator(self):
+        """Background thread to pre-generate IDs"""
+        def generate_batch():
+            while True:
+                if self.batch_cache.qsize() < 500:
+                    for _ in range(100):
+                        try:
+                            id = self.generator.generate()
+                            self.batch_cache.put(id, block=False)
+                        except queue.Full:
+                            break
+                time.sleep(0.001)
+
+        thread = threading.Thread(target=generate_batch, daemon=True)
+        thread.start()
+
+    def get_id(self):
+        """Get single ID from pre-generated cache or generate on demand"""
+        try:
+            return self.batch_cache.get_nowait()
+        except queue.Empty:
+            return self.generator.generate()
+
+    def get_ids(self, count):
+        """Get batch of IDs"""
+        ids = []
+        for _ in range(count):
+            ids.append(self.get_id())
+        return ids
+```
+
+**Deep Dive**
+- **Clock synchronization:** Use NTP with monitoring. Alert if clock drifts >1 second. Consider GPS time for financial systems.
+- **Sequence exhaustion:** 4096 IDs per millisecond per node = 4M IDs/sec/node. If exceeded, wait for next millisecond (adds latency).
+- **ID ordering:** IDs are roughly time-ordered (same millisecond may have different node IDs interleaved). For strict ordering, use single generator or logical clocks.
+- **Database considerations:** 64-bit IDs fit in BIGINT. Time-ordered IDs cause B-tree hotspots on recent inserts (use hash partitioning if problematic).
+
+**Trade-offs**
+- Snowflake vs UUID: Snowflake is 64 bits (smaller, sortable), UUID is 128 bits (no coordination, but larger and random)
+- Timestamp precision: Millisecond gives 69 years; second gives 69,000 years but only 4K IDs/sec
+- Node ID bits vs Sequence bits: More node bits = more machines; more sequence bits = higher throughput per machine
+
 ## Section 4: Data Platform Questions
 
 ### Question 11: Design a Stream Processing System (Flink/Spark Streaming)
