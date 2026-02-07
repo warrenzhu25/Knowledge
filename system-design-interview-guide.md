@@ -1013,6 +1013,225 @@ Seed URLs → URL Frontier (priority queue)
 - Politeness queue: separate queue per domain, enforce delay between requests to same domain (respect crawl-delay in robots.txt)
 - Implementation: multiple FIFO queues (one per domain) behind a priority selector
 
+**URL Frontier Implementation:**
+
+*Two-Level Architecture:*
+```
+                    ┌─────────────────────────────────┐
+                    │     Front Queues (Priority)      │
+                    │  ┌─────┐ ┌─────┐ ┌─────┐        │
+   URLs to crawl ──▶│  │ P1  │ │ P2  │ │ P3  │ ...    │  (by importance)
+                    │  │(high)│ │(med)│ │(low)│        │
+                    │  └──┬──┘ └──┬──┘ └──┬──┘        │
+                    └─────┼──────┼──────┼────────────┘
+                          │      │      │
+                          ▼      ▼      ▼
+                    ┌─────────────────────────────────┐
+                    │   Bipartite Mapping (priority    │
+                    │   → domain queue assignment)     │
+                    └─────────────┬───────────────────┘
+                                  │
+                    ┌─────────────▼───────────────────┐
+                    │     Back Queues (Politeness)     │
+                    │  ┌─────┐ ┌─────┐ ┌─────┐        │
+                    │  │dom1 │ │dom2 │ │dom3 │ ...    │  (per domain FIFO)
+                    │  └──┬──┘ └──┬──┘ └──┬──┘        │
+                    └─────┼──────┼──────┼────────────┘
+                          │      │      │
+                          ▼      ▼      ▼
+                    ┌─────────────────────────────────┐
+                    │      Back Queue Selector         │
+                    │  (round-robin with rate limit)   │
+                    └─────────────┬───────────────────┘
+                                  │
+                                  ▼
+                            Fetcher Workers
+```
+
+*Priority Score Calculation:*
+```python
+class URLPrioritizer:
+    def calculate_priority(self, url, metadata):
+        """Calculate priority score (higher = more important)"""
+        score = 0.0
+
+        # 1. PageRank / Domain authority (pre-computed)
+        domain = extract_domain(url)
+        score += self.domain_authority.get(domain, 0.1) * 40  # 0-40 points
+
+        # 2. URL depth (shorter paths = more important)
+        path_depth = url.count('/') - 2  # subtract protocol slashes
+        score += max(0, 20 - path_depth * 2)  # 0-20 points
+
+        # 3. Freshness need (time since last crawl)
+        if metadata.last_crawled:
+            hours_since = (now() - metadata.last_crawled).total_seconds() / 3600
+            expected_change_rate = metadata.change_frequency or 24  # hours
+            freshness_score = min(hours_since / expected_change_rate, 1.0)
+            score += freshness_score * 20  # 0-20 points
+        else:
+            score += 20  # Never crawled = high priority
+
+        # 4. Content type bonus
+        if self._is_important_page(url):
+            score += 10  # Homepage, sitemap, etc.
+
+        # 5. Referrer count (how many pages link to this)
+        score += min(metadata.inlink_count * 0.5, 10)  # 0-10 points
+
+        return score
+
+    def assign_to_priority_queue(self, score):
+        """Map score to priority queue (0 = highest priority)"""
+        if score >= 80:
+            return 0  # High priority
+        elif score >= 50:
+            return 1  # Medium priority
+        elif score >= 20:
+            return 2  # Low priority
+        else:
+            return 3  # Background priority
+```
+
+*URL Frontier with Politeness:*
+```python
+class URLFrontier:
+    def __init__(self, num_priority_queues=4, politeness_delay=1.0):
+        # Front queues: priority-based
+        self.front_queues = [deque() for _ in range(num_priority_queues)]
+
+        # Back queues: one per domain for politeness
+        self.back_queues = {}  # domain -> deque of URLs
+        self.domain_heap = []  # min-heap of (next_allowed_time, domain)
+        self.politeness_delay = politeness_delay  # seconds between requests
+
+        # Mapping: track which back queue each front queue item goes to
+        self.prioritizer = URLPrioritizer()
+
+        # Concurrency control
+        self.lock = threading.Lock()
+
+    def add_url(self, url, metadata=None):
+        """Add URL to frontier with priority assignment"""
+        metadata = metadata or URLMetadata()
+        domain = extract_domain(url)
+
+        with self.lock:
+            # Check if already in frontier (dedup)
+            if self._is_duplicate(url):
+                return False
+
+            # Calculate priority and add to front queue
+            priority = self.prioritizer.calculate_priority(url, metadata)
+            queue_idx = self.prioritizer.assign_to_priority_queue(priority)
+            self.front_queues[queue_idx].append((url, domain, priority))
+
+            return True
+
+    def get_next_url(self):
+        """Get next URL respecting both priority and politeness"""
+        with self.lock:
+            current_time = time.time()
+
+            # Find a domain that's ready to be crawled
+            while self.domain_heap:
+                next_time, domain = self.domain_heap[0]
+                if next_time > current_time:
+                    # No domain ready yet, wait or return None
+                    return None
+
+                heapq.heappop(self.domain_heap)
+
+                # Get URL from this domain's back queue
+                if domain in self.back_queues and self.back_queues[domain]:
+                    url = self.back_queues[domain].popleft()
+
+                    # Schedule next fetch for this domain
+                    next_allowed = current_time + self._get_crawl_delay(domain)
+                    if self.back_queues[domain]:  # More URLs waiting
+                        heapq.heappush(self.domain_heap, (next_allowed, domain))
+
+                    return url
+
+            # No URLs in back queues, move from front to back
+            self._refill_back_queues()
+            return self.get_next_url() if self.domain_heap else None
+
+    def _refill_back_queues(self):
+        """Move URLs from priority front queues to per-domain back queues"""
+        # Process front queues in priority order
+        for queue in self.front_queues:
+            while queue:
+                url, domain, priority = queue.popleft()
+
+                # Add to domain's back queue
+                if domain not in self.back_queues:
+                    self.back_queues[domain] = deque()
+                    # First URL for this domain, add to heap immediately
+                    heapq.heappush(self.domain_heap, (time.time(), domain))
+
+                self.back_queues[domain].append(url)
+
+                # Limit refill batch size
+                if len(self.domain_heap) >= 1000:
+                    return
+
+    def _get_crawl_delay(self, domain):
+        """Get politeness delay for domain (from robots.txt or default)"""
+        robots_delay = self.robots_cache.get_crawl_delay(domain)
+        return max(robots_delay or self.politeness_delay, 1.0)
+```
+
+*Distributed Frontier with Redis:*
+```python
+class DistributedURLFrontier:
+    def __init__(self, redis_client, worker_id):
+        self.redis = redis_client
+        self.worker_id = worker_id
+
+    def add_url(self, url, priority_score):
+        """Add URL to distributed priority queue"""
+        domain = extract_domain(url)
+
+        # Add to priority sorted set (score = negative priority for min-heap behavior)
+        self.redis.zadd(f"frontier:priority:{domain}", {url: -priority_score})
+
+        # Track domain in active domains set
+        self.redis.sadd("frontier:domains", domain)
+
+    def get_next_url(self):
+        """Atomically get next URL respecting politeness"""
+        # Get domains assigned to this worker (consistent hashing)
+        my_domains = self._get_assigned_domains()
+
+        for domain in my_domains:
+            # Check if domain is ready (politeness)
+            last_fetch_key = f"frontier:last_fetch:{domain}"
+            last_fetch = self.redis.get(last_fetch_key)
+
+            if last_fetch:
+                elapsed = time.time() - float(last_fetch)
+                delay = self._get_crawl_delay(domain)
+                if elapsed < delay:
+                    continue  # Not ready yet
+
+            # Atomically pop highest priority URL for this domain
+            result = self.redis.zpopmin(f"frontier:priority:{domain}", count=1)
+            if result:
+                url, score = result[0]
+                # Record fetch time for politeness
+                self.redis.set(last_fetch_key, time.time(), ex=3600)
+                return url
+
+        return None  # No URLs ready
+
+    def _get_assigned_domains(self):
+        """Get domains assigned to this worker via consistent hashing"""
+        all_domains = self.redis.smembers("frontier:domains")
+        return [d for d in all_domains
+                if consistent_hash(d) % NUM_WORKERS == self.worker_id]
+```
+
 *Fetcher:*
 - Distributed workers fetch URLs from frontier
 - DNS resolver cache (avoid repeated DNS lookups)
