@@ -126,41 +126,40 @@ Cache memory: Read QPS × avg_object_size × cache_duration (80/20 rule)
 - **L4 vs L7** — L4 (transport layer, faster, no content inspection) vs L7 (application layer, content-based routing, SSL termination).
 
 **Consistent Hashing Ring Implementation:**
-```python
-class ConsistentHashRing:
-    def __init__(self, nodes=[], vnodes=150):
-        self.vnodes = vnodes  # virtual nodes per physical node
-        self.ring = {}        # hash -> node mapping
-        self.sorted_keys = [] # sorted hash positions
-        for node in nodes:
-            self.add_node(node)
 
-    def _hash(self, key):
-        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+*Data Structures:*
+- `ring`: Map of hash_position → server_name
+- `sorted_keys`: Sorted list of all hash positions on the ring
+- `vnodes`: Number of virtual nodes per physical server (typically 100-200)
 
-    def add_node(self, node):
-        for i in range(self.vnodes):
-            vnode_key = f"{node}:vnode{i}"
-            hash_val = self._hash(vnode_key)
-            self.ring[hash_val] = node
-            bisect.insort(self.sorted_keys, hash_val)
-
-    def remove_node(self, node):
-        for i in range(self.vnodes):
-            vnode_key = f"{node}:vnode{i}"
-            hash_val = self._hash(vnode_key)
-            del self.ring[hash_val]
-            self.sorted_keys.remove(hash_val)
-
-    def get_node(self, key):
-        if not self.ring:
-            return None
-        hash_val = self._hash(key)
-        idx = bisect.bisect_right(self.sorted_keys, hash_val)
-        if idx == len(self.sorted_keys):
-            idx = 0  # wrap around
-        return self.ring[self.sorted_keys[idx]]
+*Adding a Server:*
 ```
+FOR i = 0 to num_virtual_nodes:
+    virtual_key = server_name + ":vnode" + i
+    hash_position = MD5(virtual_key) as integer
+    ring[hash_position] = server_name
+    INSERT hash_position into sorted_keys (maintaining sorted order)
+```
+
+*Removing a Server:*
+```
+FOR i = 0 to num_virtual_nodes:
+    virtual_key = server_name + ":vnode" + i
+    hash_position = MD5(virtual_key) as integer
+    DELETE ring[hash_position]
+    REMOVE hash_position from sorted_keys
+```
+
+*Finding Server for a Key:*
+```
+hash_position = MD5(key) as integer
+index = binary_search(sorted_keys, hash_position)  // find first position >= hash
+IF index reaches end of list:
+    index = 0  // wrap around to first server
+RETURN ring[sorted_keys[index]]
+```
+
+*Why Virtual Nodes:* Without vnodes, removing one server moves all its keys to just one neighbor. With 150 vnodes per server, keys redistribute evenly across ~150 different neighbors.
 
 ### Message Queues & Event-Driven Architecture
 
@@ -229,45 +228,46 @@ Client → API Gateway → Write Service → DB (key-value store)
 - For distributed ID generation: pre-allocate ID ranges to each server, or use Snowflake IDs
 
 **Base62 Encoding Implementation:**
-```python
-CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-def encode_base62(num):
-    if num == 0:
-        return CHARSET[0]
-    result = []
-    while num > 0:
-        result.append(CHARSET[num % 62])
-        num //= 62
-    return ''.join(reversed(result))
+*Characters:* 0-9 (10) + A-Z (26) + a-z (26) = 62 characters
 
-def decode_base62(s):
-    num = 0
-    for char in s:
-        num = num * 62 + CHARSET.index(char)
-    return num
+*Encode (number → short string):*
+```
+WHILE number > 0:
+    remainder = number % 62
+    PREPEND charset[remainder] to result
+    number = number / 62 (integer division)
+RETURN result
 
-# Example: encode_base62(123456789) → "8M0kX"
-# 7 chars supports 62^7 = 3.5 trillion unique URLs
+Example: 123456789 → "8M0kX"
 ```
 
-**Distributed ID Generation:**
-```python
-class IDGenerator:
-    def __init__(self, server_id, range_size=10000):
-        self.server_id = server_id
-        self.range_size = range_size
-        self.current_id = None
-        self.range_end = None
-
-    def next_id(self):
-        if self.current_id is None or self.current_id >= self.range_end:
-            # Request new range from coordination service
-            self.current_id, self.range_end = self._allocate_range()
-        id = self.current_id
-        self.current_id += 1
-        return id
+*Decode (short string → number):*
 ```
+number = 0
+FOR each character in string:
+    number = number × 62 + position_of(character)
+RETURN number
+```
+
+*Capacity:* 7 characters = 62^7 = 3.5 trillion unique URLs
+
+**Distributed ID Generation (Range-Based):**
+
+*How It Works:*
+```
+Each server pre-allocates a range of IDs from central coordinator:
+  Server 1 gets range [1 - 10000]
+  Server 2 gets range [10001 - 20000]
+  ...
+
+When generating next ID:
+  IF current_id is empty OR current_id >= range_end:
+      Request new range from coordinator
+  RETURN current_id, then increment it
+```
+
+*Benefit:* No coordination needed for each ID—only when range exhausted (~every 10K IDs)
 
 *Data Model:*
 ```
@@ -338,49 +338,39 @@ Value: {tokens: int, last_refill: timestamp}
 Operations: GET + SET with TTL (atomic via Lua script)
 ```
 
-**Token Bucket Rate Limiter (Redis Lua Script):**
-```lua
--- Token Bucket Rate Limiter (atomic Lua script)
-local key = KEYS[1]
-local max_tokens = tonumber(ARGV[1])
-local refill_rate = tonumber(ARGV[2])  -- tokens per second
-local now = tonumber(ARGV[3])
-local requested = tonumber(ARGV[4]) or 1
+**Token Bucket Rate Limiter (Atomic Redis Operation):**
 
-local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
-local tokens = tonumber(bucket[1]) or max_tokens
-local last_refill = tonumber(bucket[2]) or now
+*Algorithm (executed atomically in Redis):*
+```
+INPUT: user_key, max_tokens (e.g., 100), refill_rate (e.g., 10/sec), current_time
 
--- Refill tokens based on elapsed time
-local elapsed = now - last_refill
-local refill = elapsed * refill_rate
-tokens = math.min(max_tokens, tokens + refill)
+1. READ bucket from Redis: {tokens, last_refill_time}
+   - If not exists, initialize with max_tokens
 
--- Check if request can be allowed
-if tokens >= requested then
-    tokens = tokens - requested
-    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
-    redis.call('EXPIRE', key, 3600)
-    return {1, tokens}  -- allowed, remaining tokens
-else
-    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
-    redis.call('EXPIRE', key, 3600)
-    return {0, tokens}  -- rejected, remaining tokens
-end
+2. REFILL tokens based on elapsed time:
+   elapsed_seconds = current_time - last_refill_time
+   tokens_to_add = elapsed_seconds × refill_rate
+   new_tokens = MIN(max_tokens, current_tokens + tokens_to_add)
+
+3. CHECK if request allowed:
+   IF new_tokens >= 1:
+       new_tokens = new_tokens - 1
+       SAVE {tokens: new_tokens, last_refill: current_time}
+       RETURN allowed=true, remaining=new_tokens
+   ELSE:
+       SAVE {tokens: new_tokens, last_refill: current_time}
+       RETURN allowed=false, remaining=new_tokens
+
+4. SET key expiry to 1 hour (cleanup inactive users)
 ```
 
-**Rate Limiter Usage:**
-```python
-def check_rate_limit(user_id, endpoint, max_tokens=100, refill_rate=10):
-    key = f"ratelimit:{user_id}:{endpoint}"
-    now = time.time()
-    allowed, remaining = redis.eval(LUA_SCRIPT, 1, key, max_tokens, refill_rate, now, 1)
-    return {
-        "allowed": bool(allowed),
-        "X-RateLimit-Remaining": remaining,
-        "X-RateLimit-Limit": max_tokens,
-        "X-RateLimit-Reset": int(now) + int((max_tokens - remaining) / refill_rate)
-    }
+*Why Atomic:* Lua script runs as single Redis command—no race condition between read and write.
+
+*Response Headers:*
+```
+X-RateLimit-Limit: 100           (max tokens)
+X-RateLimit-Remaining: 47        (tokens left)
+X-RateLimit-Reset: 1704067205    (Unix time when bucket refills)
 ```
 
 **Deep Dive**
@@ -576,32 +566,39 @@ segment_1.ts
 ```
 
 **Bitrate Selection Algorithm:**
-```python
-class ABRController:
-    def __init__(self):
-        self.throughput_history = []  # last N measurements
-        self.buffer_level = 0         # seconds of buffered video
 
-    def select_variant(self, variants, measured_throughput):
-        # Exponential weighted moving average of throughput
-        self.throughput_history.append(measured_throughput)
-        ewma = self._compute_ewma(self.throughput_history, alpha=0.3)
+*Inputs:*
+- Available quality variants: [360p@800kbps, 480p@1.4Mbps, 720p@2.8Mbps, 1080p@5Mbps]
+- Measured download throughput (from last segment download)
+- Buffer level (seconds of video already buffered)
 
-        # Conservative estimate: use 70% of measured throughput
-        safe_bandwidth = ewma * 0.7
+*Selection Logic:*
+```
+1. CALCULATE smoothed throughput:
+   - Use exponential weighted moving average (EWMA) of recent measurements
+   - Smooths out network fluctuations
 
-        # Buffer-based adjustment
-        if self.buffer_level < 5:      # low buffer: be conservative
-            safe_bandwidth *= 0.5
-        elif self.buffer_level > 30:   # high buffer: can be aggressive
-            safe_bandwidth *= 1.2
+2. APPLY safety margin:
+   safe_bandwidth = smoothed_throughput × 0.7   (use 70% to avoid rebuffering)
 
-        # Select highest variant that fits
-        selected = variants[0]  # lowest quality as fallback
-        for variant in sorted(variants, key=lambda v: v.bandwidth):
-            if variant.bandwidth <= safe_bandwidth:
-                selected = variant
-        return selected
+3. ADJUST based on buffer level:
+   IF buffer < 5 seconds:
+       safe_bandwidth = safe_bandwidth × 0.5   (low buffer, be conservative)
+   ELSE IF buffer > 30 seconds:
+       safe_bandwidth = safe_bandwidth × 1.2   (high buffer, can try higher quality)
+
+4. SELECT highest quality that fits:
+   FOR each variant (sorted by bandwidth, lowest first):
+       IF variant.bandwidth <= safe_bandwidth:
+           selected = variant
+   RETURN selected
+
+Example:
+  Measured throughput: 4 Mbps
+  EWMA smoothed: 3.5 Mbps
+  Safe bandwidth: 3.5 × 0.7 = 2.45 Mbps
+  Buffer: 12 seconds (normal)
+  → Select 720p (2.8 Mbps > 2.45, so pick 480p@1.4 Mbps)
 ```
 
 *CDN Strategy:*
@@ -1049,188 +1046,94 @@ Seed URLs → URL Frontier (priority queue)
 ```
 
 *Priority Score Calculation:*
-```python
-class URLPrioritizer:
-    def calculate_priority(self, url, metadata):
-        """Calculate priority score (higher = more important)"""
-        score = 0.0
 
-        # 1. PageRank / Domain authority (pre-computed)
-        domain = extract_domain(url)
-        score += self.domain_authority.get(domain, 0.1) * 40  # 0-40 points
+| Factor | Points | Logic |
+|--------|--------|-------|
+| Domain Authority | 0-40 | PageRank or pre-computed authority score × 40 |
+| URL Depth | 0-20 | 20 - (number_of_slashes × 2). Shorter paths = higher priority |
+| Freshness | 0-20 | hours_since_crawl / expected_change_rate. Never crawled = 20 |
+| Important Page | +10 | Bonus for homepage, sitemap, robots.txt |
+| Inlink Count | 0-10 | More pages linking to it = more important |
 
-        # 2. URL depth (shorter paths = more important)
-        path_depth = url.count('/') - 2  # subtract protocol slashes
-        score += max(0, 20 - path_depth * 2)  # 0-20 points
-
-        # 3. Freshness need (time since last crawl)
-        if metadata.last_crawled:
-            hours_since = (now() - metadata.last_crawled).total_seconds() / 3600
-            expected_change_rate = metadata.change_frequency or 24  # hours
-            freshness_score = min(hours_since / expected_change_rate, 1.0)
-            score += freshness_score * 20  # 0-20 points
-        else:
-            score += 20  # Never crawled = high priority
-
-        # 4. Content type bonus
-        if self._is_important_page(url):
-            score += 10  # Homepage, sitemap, etc.
-
-        # 5. Referrer count (how many pages link to this)
-        score += min(metadata.inlink_count * 0.5, 10)  # 0-10 points
-
-        return score
-
-    def assign_to_priority_queue(self, score):
-        """Map score to priority queue (0 = highest priority)"""
-        if score >= 80:
-            return 0  # High priority
-        elif score >= 50:
-            return 1  # Medium priority
-        elif score >= 20:
-            return 2  # Low priority
-        else:
-            return 3  # Background priority
+*Queue Assignment:*
+```
+Score 80-100 → Queue 0 (High priority)
+Score 50-79  → Queue 1 (Medium priority)
+Score 20-49  → Queue 2 (Low priority)
+Score 0-19   → Queue 3 (Background)
 ```
 
 *URL Frontier with Politeness:*
-```python
-class URLFrontier:
-    def __init__(self, num_priority_queues=4, politeness_delay=1.0):
-        # Front queues: priority-based
-        self.front_queues = [deque() for _ in range(num_priority_queues)]
 
-        # Back queues: one per domain for politeness
-        self.back_queues = {}  # domain -> deque of URLs
-        self.domain_heap = []  # min-heap of (next_allowed_time, domain)
-        self.politeness_delay = politeness_delay  # seconds between requests
+*Data Structures:*
+- `front_queues[4]`: Priority queues (high/medium/low/background)
+- `back_queues{domain → queue}`: Per-domain FIFO queues
+- `domain_heap`: Min-heap of (next_allowed_time, domain) for scheduling
 
-        # Mapping: track which back queue each front queue item goes to
-        self.prioritizer = URLPrioritizer()
+*Adding a URL:*
+```
+1. Check if URL already in frontier (skip duplicates)
+2. Calculate priority score
+3. Assign to appropriate front queue based on score
+```
 
-        # Concurrency control
-        self.lock = threading.Lock()
+*Getting Next URL (respects both priority and politeness):*
+```
+1. LOOK at domain_heap to find domain ready for crawling:
+   - Peek at smallest (next_allowed_time, domain)
+   - IF next_allowed_time > current_time: no domain ready, wait
 
-    def add_url(self, url, metadata=None):
-        """Add URL to frontier with priority assignment"""
-        metadata = metadata or URLMetadata()
-        domain = extract_domain(url)
+2. POP that domain from heap
+3. GET first URL from that domain's back queue
+4. SCHEDULE next crawl for this domain:
+   next_allowed = now + crawl_delay (from robots.txt or default 1s)
+   IF more URLs waiting for this domain:
+       PUSH (next_allowed, domain) back to heap
+5. RETURN the URL
 
-        with self.lock:
-            # Check if already in frontier (dedup)
-            if self._is_duplicate(url):
-                return False
+If back queues empty: refill from front queues
+```
 
-            # Calculate priority and add to front queue
-            priority = self.prioritizer.calculate_priority(url, metadata)
-            queue_idx = self.prioritizer.assign_to_priority_queue(priority)
-            self.front_queues[queue_idx].append((url, domain, priority))
-
-            return True
-
-    def get_next_url(self):
-        """Get next URL respecting both priority and politeness"""
-        with self.lock:
-            current_time = time.time()
-
-            # Find a domain that's ready to be crawled
-            while self.domain_heap:
-                next_time, domain = self.domain_heap[0]
-                if next_time > current_time:
-                    # No domain ready yet, wait or return None
-                    return None
-
-                heapq.heappop(self.domain_heap)
-
-                # Get URL from this domain's back queue
-                if domain in self.back_queues and self.back_queues[domain]:
-                    url = self.back_queues[domain].popleft()
-
-                    # Schedule next fetch for this domain
-                    next_allowed = current_time + self._get_crawl_delay(domain)
-                    if self.back_queues[domain]:  # More URLs waiting
-                        heapq.heappush(self.domain_heap, (next_allowed, domain))
-
-                    return url
-
-            # No URLs in back queues, move from front to back
-            self._refill_back_queues()
-            return self.get_next_url() if self.domain_heap else None
-
-    def _refill_back_queues(self):
-        """Move URLs from priority front queues to per-domain back queues"""
-        # Process front queues in priority order
-        for queue in self.front_queues:
-            while queue:
-                url, domain, priority = queue.popleft()
-
-                # Add to domain's back queue
-                if domain not in self.back_queues:
-                    self.back_queues[domain] = deque()
-                    # First URL for this domain, add to heap immediately
-                    heapq.heappush(self.domain_heap, (time.time(), domain))
-
-                self.back_queues[domain].append(url)
-
-                # Limit refill batch size
-                if len(self.domain_heap) >= 1000:
-                    return
-
-    def _get_crawl_delay(self, domain):
-        """Get politeness delay for domain (from robots.txt or default)"""
-        robots_delay = self.robots_cache.get_crawl_delay(domain)
-        return max(robots_delay or self.politeness_delay, 1.0)
+*Refilling Back Queues:*
+```
+FOR each front queue (high priority first):
+    WHILE queue not empty:
+        Take (url, domain, priority)
+        IF domain not in back_queues:
+            Create new back queue for domain
+            Add (current_time, domain) to heap (ready immediately)
+        Add URL to domain's back queue
+        STOP if 1000+ domains active (batch limit)
 ```
 
 *Distributed Frontier with Redis:*
-```python
-class DistributedURLFrontier:
-    def __init__(self, redis_client, worker_id):
-        self.redis = redis_client
-        self.worker_id = worker_id
 
-    def add_url(self, url, priority_score):
-        """Add URL to distributed priority queue"""
-        domain = extract_domain(url)
+*Redis Data Structures:*
+- `frontier:priority:{domain}` → Sorted Set (score = negative priority)
+- `frontier:domains` → Set of all active domains
+- `frontier:last_fetch:{domain}` → Last fetch timestamp (with 1hr expiry)
 
-        # Add to priority sorted set (score = negative priority for min-heap behavior)
-        self.redis.zadd(f"frontier:priority:{domain}", {url: -priority_score})
-
-        # Track domain in active domains set
-        self.redis.sadd("frontier:domains", domain)
-
-    def get_next_url(self):
-        """Atomically get next URL respecting politeness"""
-        # Get domains assigned to this worker (consistent hashing)
-        my_domains = self._get_assigned_domains()
-
-        for domain in my_domains:
-            # Check if domain is ready (politeness)
-            last_fetch_key = f"frontier:last_fetch:{domain}"
-            last_fetch = self.redis.get(last_fetch_key)
-
-            if last_fetch:
-                elapsed = time.time() - float(last_fetch)
-                delay = self._get_crawl_delay(domain)
-                if elapsed < delay:
-                    continue  # Not ready yet
-
-            # Atomically pop highest priority URL for this domain
-            result = self.redis.zpopmin(f"frontier:priority:{domain}", count=1)
-            if result:
-                url, score = result[0]
-                # Record fetch time for politeness
-                self.redis.set(last_fetch_key, time.time(), ex=3600)
-                return url
-
-        return None  # No URLs ready
-
-    def _get_assigned_domains(self):
-        """Get domains assigned to this worker via consistent hashing"""
-        all_domains = self.redis.smembers("frontier:domains")
-        return [d for d in all_domains
-                if consistent_hash(d) % NUM_WORKERS == self.worker_id]
+*Adding URL:*
 ```
+ZADD frontier:priority:{domain} {url: -priority_score}
+SADD frontier:domains {domain}
+```
+
+*Getting Next URL:*
+```
+1. GET domains assigned to this worker (via consistent hashing)
+
+2. FOR each assigned domain:
+   - CHECK last fetch time from Redis
+   - IF elapsed < crawl_delay: skip (not ready)
+   - ZPOPMIN to atomically get highest priority URL
+   - SET last fetch time
+   - RETURN url
+
+3. If no URLs ready: RETURN null
+```
+
+*Worker Assignment:* `consistent_hash(domain) % num_workers == my_worker_id`
 
 *Fetcher:*
 - Distributed workers fetch URLs from frontier
@@ -1320,173 +1223,111 @@ ETA calculations: 230 × 10 (driver candidates) = 2300 routing requests/sec
 - Options: Redis with Geo commands, custom geohash index, or S2 cells
 
 **Geohash-Based Driver Index:**
-```python
-class DriverLocationIndex:
-    def __init__(self, redis_client):
-        self.redis = redis_client
-        self.precision = 6  # ~1.2km x 0.6km cells
 
-    def update_location(self, driver_id, lat, lng, status='available'):
-        geohash = encode_geohash(lat, lng, self.precision)
-        # Store in sorted set: score = timestamp, enables TTL-based cleanup
-        self.redis.zadd(f"drivers:{geohash}", {driver_id: time.time()})
-        self.redis.hset(f"driver:{driver_id}", mapping={
-            'lat': lat, 'lng': lng, 'status': status, 'geohash': geohash
-        })
-        self.redis.expire(f"driver:{driver_id}", 30)  # TTL for stale drivers
+*Redis Data Structures:*
+- `drivers:{geohash}` → Sorted Set of driver_ids (score = timestamp)
+- `driver:{driver_id}` → Hash with lat, lng, status, geohash (expires in 30s)
 
-    def find_nearby_drivers(self, lat, lng, radius_km=3, limit=10):
-        center_hash = encode_geohash(lat, lng, self.precision)
-        # Get 9 neighboring cells (center + 8 adjacent)
-        neighbors = get_geohash_neighbors(center_hash)
+*Updating Driver Location:*
+```
+1. ENCODE driver's lat/lng to geohash (precision 6 = ~1km cells)
+2. ADD driver_id to sorted set for that geohash cell
+3. STORE driver details (lat, lng, status) in hash
+4. SET 30-second expiry (auto-remove stale drivers)
+```
 
-        candidates = []
-        for gh in neighbors:
-            driver_ids = self.redis.zrange(f"drivers:{gh}", 0, -1)
-            for did in driver_ids:
-                driver = self.redis.hgetall(f"driver:{did}")
-                if driver.get('status') == 'available':
-                    dist = haversine(lat, lng, driver['lat'], driver['lng'])
-                    if dist <= radius_km:
-                        candidates.append((did, dist, driver))
-
-        # Sort by distance, return closest
-        candidates.sort(key=lambda x: x[1])
-        return candidates[:limit]
+*Finding Nearby Drivers:*
+```
+1. ENCODE pickup location to geohash
+2. GET 9 cells: center cell + 8 neighbors (handles edge cases)
+3. FOR each cell:
+     GET all driver_ids from that cell's sorted set
+     FOR each driver:
+       IF status = "available":
+         CALCULATE exact distance using Haversine formula
+         IF distance ≤ radius: add to candidates
+4. SORT candidates by distance
+5. RETURN closest N drivers
 ```
 
 *Matching Algorithm:*
-```python
-class RideMatchingService:
-    def match_rider_to_driver(self, rider_request):
-        pickup = rider_request.pickup_location
 
-        # 1. Find nearby available drivers (expand radius if needed)
-        for radius in [2, 5, 10]:  # km
-            candidates = location_index.find_nearby_drivers(
-                pickup.lat, pickup.lng, radius, limit=20
-            )
-            if len(candidates) >= 5:
-                break
+```
+Step 1: Find nearby drivers (expand search if needed)
+  TRY radius 2km, then 5km, then 10km
+  STOP when at least 5 candidates found
+  IF no candidates: return "no drivers available"
 
-        if not candidates:
-            return None  # No drivers available
+Step 2: Calculate ETA for each candidate (in parallel)
+  CALL routing service for each driver → pickup location
 
-        # 2. Calculate ETA for each candidate (parallel API calls)
-        with ThreadPoolExecutor() as executor:
-            etas = list(executor.map(
-                lambda d: routing_service.get_eta(d.location, pickup),
-                candidates
-            ))
+Step 3: Score each candidate
+  score = (-ETA × 2) + (rating × 1) + (acceptance_rate × 0.5)
 
-        # 3. Score candidates (ETA + driver rating + acceptance rate)
-        scored = []
-        for driver, eta in zip(candidates, etas):
-            score = (
-                -eta.minutes * 2.0 +           # Lower ETA is better
-                driver.rating * 1.0 +           # Higher rating is better
-                driver.acceptance_rate * 0.5    # Higher acceptance is better
-            )
-            scored.append((driver, eta, score))
+  Example: 5 min ETA, 4.8 rating, 90% acceptance
+  score = (-5 × 2) + (4.8 × 1) + (0.9 × 0.5) = -10 + 4.8 + 0.45 = -4.75
 
-        scored.sort(key=lambda x: -x[2])  # Highest score first
-
-        # 4. Dispatch to best driver (with timeout for response)
-        for driver, eta, score in scored:
-            offer = create_ride_offer(rider_request, driver, eta)
-            response = send_offer_with_timeout(driver, offer, timeout=15)
-            if response.accepted:
-                return create_trip(rider_request, driver, eta)
-            # Driver declined or timeout, try next
-
-        return None  # All drivers declined
+Step 4: Dispatch to drivers in score order
+  FOR each driver (best score first):
+    SEND ride offer with 15-second timeout
+    IF driver accepts: CREATE trip, RETURN success
+    IF declined or timeout: try next driver
+  RETURN "all drivers declined"
 ```
 
-*Supply Positioning (Driver Demand Heatmap):*
-```python
-class DemandHeatmapService:
-    def __init__(self):
-        self.cell_size = 500  # meters
-        self.history_window = 30  # minutes
+*Supply Positioning (Demand Heatmap):*
 
-    def calculate_demand_heatmap(self, city_bounds):
-        """Predict demand per cell for next 15 minutes"""
-        cells = grid_partition(city_bounds, self.cell_size)
+*Predicting Demand per Cell:*
+```
+Divide city into 500m × 500m grid cells
 
-        for cell in cells:
-            # Historical demand (same time, day of week, weather)
-            historical = self.get_historical_demand(cell, lookback_weeks=4)
-            # Recent trend (last 30 min requests in this cell)
-            recent = self.get_recent_requests(cell, self.history_window)
-            # Events (concerts, sports games from calendar API)
-            events = self.get_nearby_events(cell)
+FOR each cell:
+  predicted_demand =
+      50% × historical_average (same time, day of week, last 4 weeks)
+    + 30% × recent_trend (requests in last 30 minutes)
+    + 20% × event_impact (nearby concerts, games, etc.)
 
-            cell.predicted_demand = (
-                0.5 * historical.avg +
-                0.3 * recent.trend +
-                0.2 * events.impact
-            )
-            cell.current_supply = len(self.get_drivers_in_cell(cell))
-            cell.supply_gap = cell.predicted_demand - cell.current_supply
+  current_supply = count of drivers in this cell
+  supply_gap = predicted_demand - current_supply
+```
 
-        return cells
-
-    def suggest_driver_repositioning(self, driver):
-        """Suggest where driver should move for higher earnings"""
-        nearby_cells = self.get_cells_within_radius(driver.location, 5)  # 5km
-        # Find undersupplied cells with high demand
-        opportunities = [c for c in nearby_cells if c.supply_gap > 2]
-        opportunities.sort(key=lambda c: -c.supply_gap)
-        return opportunities[:3]
+*Driver Repositioning Suggestions:*
+```
+1. FIND all cells within 5km of driver
+2. FILTER to cells where supply_gap > 2 (undersupplied)
+3. SORT by supply_gap descending
+4. RETURN top 3 opportunities
 ```
 
 *Surge Pricing:*
-```python
-def calculate_surge_multiplier(cell, current_time):
-    demand = cell.pending_requests  # Unfulfilled requests
-    supply = cell.available_drivers
 
-    if supply == 0:
-        return MAX_SURGE  # e.g., 3.0x
+```
+ratio = pending_requests / available_drivers
 
-    ratio = demand / supply
+IF no drivers: surge = 3.0x (maximum)
 
-    # Tiered surge pricing
-    if ratio < 1.0:
-        return 1.0
-    elif ratio < 1.5:
-        return 1.0 + (ratio - 1.0) * 0.5  # 1.0x - 1.25x
-    elif ratio < 2.0:
-        return 1.25 + (ratio - 1.5) * 0.5  # 1.25x - 1.5x
-    elif ratio < 3.0:
-        return 1.5 + (ratio - 2.0) * 0.5   # 1.5x - 2.0x
-    else:
-        return min(2.0 + (ratio - 3.0) * 0.25, MAX_SURGE)  # Cap at 3.0x
+Surge tiers:
+  ratio < 1.0  → 1.0x (no surge)
+  ratio 1.0-1.5 → 1.0x to 1.25x
+  ratio 1.5-2.0 → 1.25x to 1.5x
+  ratio 2.0-3.0 → 1.5x to 2.0x
+  ratio > 3.0  → 2.0x to 3.0x (capped)
+
+Example: 15 requests, 10 drivers → ratio 1.5 → surge 1.25x
 ```
 
 *Fare Calculation:*
-```python
-def calculate_fare(trip):
-    base_fare = city_config.base_fare  # e.g., $2.50
-    per_mile = city_config.per_mile    # e.g., $1.50
-    per_minute = city_config.per_minute  # e.g., $0.25
-    minimum_fare = city_config.minimum  # e.g., $8.00
 
-    distance_fare = trip.distance_miles * per_mile
-    time_fare = trip.duration_minutes * per_minute
+```
+fare = base_fare + (distance × per_mile_rate) + (duration × per_minute_rate)
 
-    subtotal = base_fare + distance_fare + time_fare
+Example (5 miles, 15 minutes):
+  $2.50 + (5 × $1.50) + (15 × $0.25) = $2.50 + $7.50 + $3.75 = $13.75
 
-    # Apply surge
-    subtotal *= trip.surge_multiplier
-
-    # Apply promotions/discounts
-    subtotal -= apply_promotions(trip.rider, subtotal)
-
-    # Tolls, airport fees, etc.
-    subtotal += trip.additional_fees
-
-    return max(subtotal, minimum_fare)
+THEN apply surge: $13.75 × 1.5 = $20.63
+THEN subtract promotions: $20.63 - $5.00 coupon = $15.63
+THEN add fees: $15.63 + $3 airport fee = $18.63
+FINALLY ensure minimum: MAX($18.63, $8.00) = $18.63
 ```
 
 **Deep Dive**
@@ -1598,222 +1439,156 @@ reminders:
 ```
 
 **Recurring Event Handling (RFC 5545 / iCal):**
-```python
-class RecurrenceRule:
-    """Parse and expand RRULE format"""
-    # Example: RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=20251231T235959Z
 
-    def __init__(self, rrule_string):
-        self.freq = None       # DAILY, WEEKLY, MONTHLY, YEARLY
-        self.interval = 1      # Every N freq units
-        self.byday = []        # MO, TU, WE, etc.
-        self.bymonthday = []   # 1-31
-        self.bymonth = []      # 1-12
-        self.until = None      # End date
-        self.count = None      # Max occurrences
-        self._parse(rrule_string)
+*RRULE Format Examples:*
+```
+RRULE:FREQ=DAILY;INTERVAL=1                    → Every day
+RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR              → Every Mon, Wed, Fri
+RRULE:FREQ=MONTHLY;BYMONTHDAY=15              → 15th of every month
+RRULE:FREQ=YEARLY;BYMONTH=12;BYMONTHDAY=25    → Every Dec 25
+RRULE:FREQ=WEEKLY;COUNT=10                     → Weekly, 10 occurrences total
+RRULE:FREQ=DAILY;UNTIL=20251231T235959Z       → Daily until end of 2025
+```
 
-    def expand(self, start_time, range_start, range_end, exceptions=None):
-        """Generate all occurrences within the given time range"""
-        exceptions = exceptions or {}
-        occurrences = []
-        current = start_time
-        count = 0
+*Expanding Occurrences:*
+```
+INPUT: recurrence rule, query range (start, end), exceptions map
 
-        while current <= range_end:
-            if self.until and current > self.until:
-                break
-            if self.count and count >= self.count:
-                break
+current = event's original start time
+count = 0
 
-            if current >= range_start:
-                original_start = current
-                if original_start in exceptions:
-                    exc = exceptions[original_start]
-                    if not exc.is_deleted:
-                        # Modified instance
-                        occurrences.append(exc.modified_event)
-                else:
-                    # Regular instance
-                    occurrences.append(self._create_instance(current))
+WHILE current <= query_end:
+    IF rule has UNTIL date AND current > UNTIL: stop
+    IF rule has COUNT AND count >= COUNT: stop
 
-            current = self._next_occurrence(current)
-            count += 1
+    IF current >= query_start:
+        IF current is in exceptions map:
+            IF not deleted: add modified version to results
+        ELSE:
+            add regular instance to results
 
-        return occurrences
+    current = next_occurrence(current, rule)
+    count++
 
-    def _next_occurrence(self, current):
-        if self.freq == 'DAILY':
-            return current + timedelta(days=self.interval)
-        elif self.freq == 'WEEKLY':
-            # Handle BYDAY (e.g., MO,WE,FR)
-            return self._next_weekly(current)
-        elif self.freq == 'MONTHLY':
-            return self._next_monthly(current)
-        elif self.freq == 'YEARLY':
-            return current.replace(year=current.year + self.interval)
+RETURN results
+
+Next occurrence by frequency:
+  DAILY:   add interval days
+  WEEKLY:  find next day matching BYDAY (MO,WE,FR)
+  MONTHLY: find next month, same day (or last day if month is shorter)
+  YEARLY:  add interval years
 ```
 
 **Event Instance Expansion on Query:**
-```python
-def get_events_in_range(user_id, calendar_ids, start, end):
-    events = []
 
-    # 1. Get non-recurring events in range
-    simple_events = db.query("""
-        SELECT * FROM events
-        WHERE calendar_id IN :calendar_ids
-        AND recurrence_rule IS NULL
-        AND start_time < :end AND end_time > :start
-    """, calendar_ids=calendar_ids, start=start, end=end)
-    events.extend(simple_events)
+```
+INPUT: user_id, calendar_ids, date range (start, end)
 
-    # 2. Get recurring event masters that might have instances in range
-    recurring_masters = db.query("""
-        SELECT * FROM events
-        WHERE calendar_id IN :calendar_ids
-        AND recurrence_rule IS NOT NULL
-        AND start_time < :end
-        AND (recurrence_end IS NULL OR recurrence_end > :start)
-    """, calendar_ids=calendar_ids, start=start, end=end)
+Step 1: Get simple (non-recurring) events
+  SELECT * FROM events
+  WHERE calendar_id IN calendar_ids
+    AND recurrence_rule IS NULL
+    AND event overlaps with range
 
-    # 3. Expand each recurring event
-    for master in recurring_masters:
-        exceptions = get_exceptions(master.event_id)
-        rule = RecurrenceRule(master.recurrence_rule)
-        instances = rule.expand(master.start_time, start, end, exceptions)
-        events.extend(instances)
+Step 2: Get recurring event masters
+  SELECT * FROM events
+  WHERE calendar_id IN calendar_ids
+    AND recurrence_rule IS NOT NULL
+    AND master_start < end
+    AND (recurrence_end IS NULL OR recurrence_end > start)
 
-    # 4. Sort by start time
-    events.sort(key=lambda e: e.start_time)
-    return events
+Step 3: Expand each recurring master
+  FOR each master event:
+    GET exceptions (modified/deleted instances)
+    PARSE recurrence rule
+    GENERATE all instances within range
+    ADD to results
+
+Step 4: Sort all events by start time
 ```
 
-**Free/Busy Query (Find Available Time):**
-```python
-class FreeBusyService:
-    def find_free_slots(self, attendee_ids, date, duration_minutes,
-                        working_hours=(9, 17)):
-        """Find available time slots when all attendees are free"""
-        busy_intervals = []
+**Free/Busy Query (Find Available Meeting Time):**
 
-        # Collect busy times for all attendees
-        for user_id in attendee_ids:
-            calendars = get_user_calendars(user_id, include_shared=True)
-            events = get_events_in_range(
-                user_id, calendars,
-                start=date.start_of_day(),
-                end=date.end_of_day()
-            )
-            for event in events:
-                if event.show_as == 'busy':
-                    busy_intervals.append((event.start_time, event.end_time))
+```
+INPUT: list of attendee_ids, date, required duration, working hours (9am-5pm)
 
-        # Merge overlapping intervals
-        merged = merge_intervals(sorted(busy_intervals))
+Step 1: Collect all busy intervals
+  FOR each attendee:
+    GET their calendars (including shared ones)
+    GET all events for the day
+    FOR each event marked as "busy":
+      ADD (start_time, end_time) to busy_intervals
 
-        # Find gaps that fit the required duration
-        free_slots = []
-        day_start = date.replace(hour=working_hours[0])
-        day_end = date.replace(hour=working_hours[1])
+Step 2: Merge overlapping intervals
+  SORT intervals by start time
+  FOR each interval:
+    IF overlaps with previous: extend previous
+    ELSE: add as new interval
 
-        current = day_start
-        for busy_start, busy_end in merged:
-            if current < busy_start:
-                gap_minutes = (busy_start - current).total_seconds() / 60
-                if gap_minutes >= duration_minutes:
-                    free_slots.append((current, busy_start))
-            current = max(current, busy_end)
+  Example: [(9:00-10:00), (9:30-11:00), (14:00-15:00)]
+       → [(9:00-11:00), (14:00-15:00)]
 
-        # Check time after last busy period
-        if current < day_end:
-            gap_minutes = (day_end - current).total_seconds() / 60
-            if gap_minutes >= duration_minutes:
-                free_slots.append((current, day_end))
+Step 3: Find gaps that fit the meeting
+  current = 9:00 AM (working hours start)
+  FOR each busy block:
+    gap = busy_start - current
+    IF gap >= required_duration:
+      ADD (current, busy_start) to free_slots
+    current = MAX(current, busy_end)
 
-        return free_slots
+  Check gap after last busy block until 5pm
 
-def merge_intervals(intervals):
-    """Merge overlapping time intervals"""
-    if not intervals:
-        return []
-    merged = [intervals[0]]
-    for start, end in intervals[1:]:
-        if start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
+RETURN free_slots
 ```
 
 **Sync Protocol (Incremental Sync):**
-```python
-class CalendarSyncService:
-    def sync(self, user_id, device_id, last_sync_token):
-        """Return changes since last sync"""
-        if last_sync_token is None:
-            # Full sync - return all events
-            events = get_all_user_events(user_id)
-            new_token = generate_sync_token(user_id)
-            return {'events': events, 'sync_token': new_token, 'full_sync': True}
 
-        # Incremental sync - return only changes
-        last_sync_time = decode_sync_token(last_sync_token)
+```
+INPUT: user_id, device_id, last_sync_token
 
-        changes = db.query("""
-            SELECT event_id, updated_at, is_deleted
-            FROM events
-            WHERE user_id = :user_id
-            AND updated_at > :last_sync
-            ORDER BY updated_at
-        """, user_id=user_id, last_sync=last_sync_time)
+IF no sync token (first sync):
+    RETURN all user's events + new sync token
 
-        updated_events = []
-        deleted_event_ids = []
+ELSE (incremental sync):
+    DECODE token to get last_sync_timestamp
 
-        for change in changes:
-            if change.is_deleted:
-                deleted_event_ids.append(change.event_id)
-            else:
-                updated_events.append(get_event(change.event_id))
+    QUERY: events WHERE updated_at > last_sync_timestamp
 
-        new_token = generate_sync_token(user_id)
-        return {
-            'updated': updated_events,
-            'deleted': deleted_event_ids,
-            'sync_token': new_token,
-            'full_sync': False
-        }
+    FOR each changed event:
+        IF deleted: add to deleted_ids list
+        ELSE: add full event to updated list
+
+    RETURN {
+        updated: [full event objects],
+        deleted: [event_ids to remove locally],
+        sync_token: new_token
+    }
 ```
 
-**Conflict Resolution (Last-Write-Wins with Version):**
-```python
-def update_event(event_id, updates, client_etag):
-    """Update event with optimistic concurrency control"""
-    current = db.get_event(event_id)
+**Conflict Resolution (Optimistic Concurrency):**
 
-    if current.etag != client_etag:
-        # Conflict detected
-        raise ConflictError(
-            message="Event was modified by another client",
-            current_event=current
-        )
-
-    new_etag = generate_etag()
-    updates['etag'] = new_etag
-    updates['updated_at'] = now()
-
-    db.update_event(event_id, updates)
-
-    # Notify other devices of this user
-    push_sync_notification(current.user_id, event_id)
-
-    # Notify attendees if significant change
-    if significant_change(current, updates):
-        notify_attendees(event_id, updates)
-
-    return new_etag
 ```
+INPUT: event_id, updates, client's etag
+
+1. FETCH current event from database
+
+2. COMPARE etags:
+   IF current.etag ≠ client_etag:
+      REJECT with "Event was modified by another client"
+      RETURN current event (so client can merge)
+
+3. GENERATE new etag (random hash or timestamp)
+   SET updated_at = now
+   SAVE event with new etag
+
+4. NOTIFY user's other devices to sync
+5. IF significant change (time, location):
+      NOTIFY all attendees
+
+RETURN new_etag
+```
+
+*Why ETags:* Each edit increments version. If client A and B both edit, first one succeeds, second gets conflict and must refresh before retrying.
 
 **Deep Dive**
 - **Timezone handling:** Store all times in UTC with IANA timezone identifier. Convert to user's timezone on display. Recurring events store the original timezone — "every Monday 9am Pacific" stays correct even when user travels.
@@ -1916,287 +1691,132 @@ Ledger entries:      2-4 per transaction (double-entry) = 40M/day
 ```
 
 **Idempotency for Exactly-Once Payments:**
-```python
-class PaymentService:
-    def process_payment(self, request, idempotency_key):
-        """Process payment with exactly-once semantics"""
-        # 1. Check idempotency cache
-        cached = self.idempotency_store.get(idempotency_key)
-        if cached:
-            if cached.status == 'processing':
-                raise PaymentInProgressError("Payment is being processed")
-            return cached.response  # Return cached result
 
-        # 2. Lock the idempotency key
-        lock_acquired = self.idempotency_store.set_if_absent(
-            idempotency_key,
-            {'status': 'processing', 'created_at': now()},
-            ttl=86400  # 24 hours
-        )
-        if not lock_acquired:
-            # Another request beat us
-            return self.process_payment(request, idempotency_key)  # Retry
+*The Problem:* Network timeout → client retries → two payments charged. We need exactly-once.
 
-        try:
-            # 3. Create payment record
-            payment = self.create_payment_record(request)
+*Solution:* Client sends unique `idempotency_key` with each request. Server returns cached result for duplicate keys.
 
-            # 4. Risk assessment
-            risk_score = self.risk_service.evaluate(payment)
-            if risk_score > RISK_THRESHOLD:
-                payment.status = 'DECLINED'
-                payment.decline_reason = 'high_risk'
-                self.save_and_cache(payment, idempotency_key)
-                return PaymentResponse(payment)
-
-            # 5. Process with payment processor
-            processor_response = self.payment_processor.authorize(payment)
-
-            # 6. Update payment status
-            if processor_response.approved:
-                payment.status = 'AUTHORIZED'
-                payment.authorization_code = processor_response.auth_code
-            else:
-                payment.status = 'DECLINED'
-                payment.decline_reason = processor_response.decline_code
-
-            # 7. Save and cache result
-            self.save_and_cache(payment, idempotency_key)
-
-            # 8. Emit event for downstream services
-            self.event_bus.publish('payment.processed', payment)
-
-            return PaymentResponse(payment)
-
-        except Exception as e:
-            # Mark idempotency key as failed (allow retry)
-            self.idempotency_store.delete(idempotency_key)
-            raise
-
-    def save_and_cache(self, payment, idempotency_key):
-        self.db.save(payment)
-        self.idempotency_store.set(
-            idempotency_key,
-            {'status': 'completed', 'response': payment.to_dict()},
-            ttl=86400
-        )
 ```
+Step 1: Check idempotency cache
+  IF key exists AND status = "processing": return "payment in progress"
+  IF key exists AND status = "completed": return cached result
+
+Step 2: Lock the key (atomic set-if-absent)
+  SET key = {status: "processing"} with 24hr TTL
+  IF lock failed (another request got it): retry from step 1
+
+Step 3-4: Create payment record, run fraud check
+  IF fraud score too high: mark DECLINED, cache result, return
+
+Step 5-6: Call payment processor (Visa/Mastercard)
+  IF approved: status = AUTHORIZED, save auth code
+  ELSE: status = DECLINED, save decline reason
+
+Step 7: Save to DB and cache final result
+
+Step 8: Publish event for analytics, notifications
+
+ON ERROR: Delete idempotency key (allow client to retry)
+```
+
+*Key insight:* Idempotency key stored in Redis with TTL. Same key always returns same result.
 
 **Double-Entry Ledger:**
-```python
-class LedgerService:
-    def record_payment(self, payment):
-        """Record payment using double-entry bookkeeping"""
-        entries = []
 
-        # Debit: Customer's liability decreases (they owe less)
-        # Credit: Merchant's receivable increases (they're owed more)
+*Rule:* Every transaction has equal debits and credits. If they don't balance, something is wrong.
 
-        # Entry 1: Debit Cash/Receivables, Credit Revenue
-        entries.append(LedgerEntry(
-            transaction_id=payment.id,
-            account_id=self.get_cash_account(),
-            entry_type='DEBIT',
-            amount=payment.amount,
-            currency=payment.currency,
-            timestamp=now()
-        ))
+*Recording a $100 payment with $3 platform fee:*
+```
+Entry 1: Payment received
+  DEBIT  Cash Account         +$100  (asset increases)
+  CREDIT Merchant Account     +$100  (liability to merchant)
 
-        entries.append(LedgerEntry(
-            transaction_id=payment.id,
-            account_id=payment.merchant_account_id,
-            entry_type='CREDIT',
-            amount=payment.amount,
-            currency=payment.currency,
-            timestamp=now()
-        ))
+Entry 2: Platform fee
+  DEBIT  Merchant Account     -$3    (reduce what we owe merchant)
+  CREDIT Platform Revenue     +$3    (our earnings)
 
-        # Entry 2: Record platform fee
-        if payment.platform_fee > 0:
-            entries.append(LedgerEntry(
-                transaction_id=payment.id,
-                account_id=payment.merchant_account_id,
-                entry_type='DEBIT',
-                amount=payment.platform_fee,
-                currency=payment.currency
-            ))
-            entries.append(LedgerEntry(
-                transaction_id=payment.id,
-                account_id=self.get_platform_revenue_account(),
-                entry_type='CREDIT',
-                amount=payment.platform_fee,
-                currency=payment.currency
-            ))
-
-        # Atomic insert of all entries
-        self.db.batch_insert(entries)
-
-        # Verify debits = credits (invariant check)
-        self.verify_transaction_balance(payment.id)
-
-    def get_account_balance(self, account_id, as_of=None):
-        """Calculate account balance from ledger entries"""
-        as_of = as_of or now()
-        credits = self.db.sum("""
-            SELECT SUM(amount) FROM ledger_entries
-            WHERE account_id = :account_id
-            AND entry_type = 'CREDIT'
-            AND timestamp <= :as_of
-        """, account_id=account_id, as_of=as_of)
-
-        debits = self.db.sum("""
-            SELECT SUM(amount) FROM ledger_entries
-            WHERE account_id = :account_id
-            AND entry_type = 'DEBIT'
-            AND timestamp <= :as_of
-        """, account_id=account_id, as_of=as_of)
-
-        return credits - debits  # For liability/revenue accounts
+Result: Merchant balance = $97, Platform earned = $3
 ```
 
+*Calculating Account Balance:*
+```
+balance = SUM(all credits) - SUM(all debits)
+
+For merchant: $100 credit - $3 debit = $97 balance
+```
+
+*Why Double-Entry:* Every dollar is accounted for. Bugs that lose money are immediately detectable (debits ≠ credits).
+
 **Fraud Detection (Real-time Scoring):**
-```python
-class FraudDetectionService:
-    def evaluate(self, payment):
-        """Real-time fraud scoring"""
-        signals = []
 
-        # 1. Velocity checks
-        recent_txns = self.get_recent_transactions(
-            payment.card_fingerprint, hours=24
-        )
-        signals.append(('velocity_24h', len(recent_txns)))
-        signals.append(('amount_24h', sum(t.amount for t in recent_txns)))
+| Signal | What It Checks | Risk Indicator |
+|--------|----------------|----------------|
+| Velocity | Transactions in last 24 hours | >10 txns = suspicious |
+| Geo mismatch | IP country ≠ card country | High risk if different |
+| Device fingerprint | Known fraudster device? | Score from 0-100 |
+| First purchase | New customer? | Slightly higher risk |
+| Unusual amount | 3x higher than user's average | Suspicious |
+| Prepaid card | Card is prepaid/gift card | Higher fraud rate |
+| High-risk country | Card from known fraud region | Higher risk |
+| ML model | Trained on historical fraud | Score 0-100 |
 
-        # 2. Geolocation
-        ip_location = self.geoip.lookup(payment.ip_address)
-        card_country = payment.card_country
-        signals.append(('geo_mismatch', ip_location.country != card_country))
-
-        # 3. Device fingerprint
-        device_score = self.device_intelligence.score(payment.device_id)
-        signals.append(('device_risk', device_score))
-
-        # 4. Behavioral analysis
-        user_history = self.get_user_history(payment.user_id)
-        signals.append(('first_purchase', len(user_history) == 0))
-        signals.append(('unusual_amount',
-            payment.amount > user_history.avg_amount * 3))
-
-        # 5. Card BIN analysis
-        bin_info = self.bin_database.lookup(payment.card_bin)
-        signals.append(('prepaid_card', bin_info.is_prepaid))
-        signals.append(('high_risk_country', bin_info.country in HIGH_RISK))
-
-        # 6. ML model prediction
-        ml_score = self.fraud_model.predict(signals)
-        signals.append(('ml_score', ml_score))
-
-        # Combine signals into final score
-        final_score = self.calculate_final_score(signals)
-
-        # Store for model training
-        self.log_evaluation(payment.id, signals, final_score)
-
-        return FraudResult(
-            score=final_score,
-            signals=signals,
-            action=self.recommend_action(final_score)
-        )
-
-    def recommend_action(self, score):
-        if score < 30:
-            return 'APPROVE'
-        elif score < 70:
-            return 'REVIEW'  # Manual review or 3DS challenge
-        else:
-            return 'DECLINE'
+*Decision Thresholds:*
+```
+Final score < 30  → APPROVE automatically
+Final score 30-70 → REVIEW (3D Secure challenge or manual review)
+Final score > 70  → DECLINE automatically
 ```
 
 **Retry Logic with Exponential Backoff:**
-```python
-class PaymentRetryHandler:
-    def __init__(self):
-        self.max_retries = 3
-        self.base_delay = 1  # seconds
 
-    async def process_with_retry(self, payment):
-        """Retry failed payments with exponential backoff"""
-        last_error = None
-
-        for attempt in range(self.max_retries + 1):
-            try:
-                result = await self.payment_processor.process(payment)
-                return result
-            except RetryableError as e:
-                last_error = e
-                if attempt < self.max_retries:
-                    delay = self.base_delay * (2 ** attempt)  # 1, 2, 4 seconds
-                    delay += random.uniform(0, 1)  # Jitter
-                    await asyncio.sleep(delay)
-                    continue
-            except NonRetryableError as e:
-                # Don't retry: invalid card, insufficient funds, fraud
-                raise
-
-        raise MaxRetriesExceeded(last_error)
 ```
+max_retries = 3
+delays = [1s, 2s, 4s]  (doubles each time)
+
+FOR attempt = 0 to 3:
+    TRY process payment
+    IF success: RETURN result
+
+    IF error is retryable (network timeout, processor busy):
+        wait = delays[attempt] + random(0-1 second)  ← jitter prevents thundering herd
+        SLEEP(wait)
+        CONTINUE
+
+    IF error is non-retryable (invalid card, insufficient funds):
+        THROW error immediately (don't retry)
+
+THROW "max retries exceeded"
+```
+
+*Retryable:* Network timeout, 503 Service Unavailable, rate limited
+*Non-retryable:* Invalid card number, expired card, insufficient funds, fraud decline
 
 **Reconciliation System:**
-```python
-class ReconciliationService:
-    def daily_reconciliation(self, date):
-        """Reconcile internal records with processor settlements"""
-        # 1. Get our internal transactions
-        internal_txns = self.db.query("""
-            SELECT * FROM payments
-            WHERE DATE(created_at) = :date
-            AND status IN ('CAPTURED', 'SETTLED')
-        """, date=date)
-        internal_by_id = {t.processor_txn_id: t for t in internal_txns}
 
-        # 2. Get processor settlement report
-        processor_txns = self.processor.get_settlement_report(date)
-        processor_by_id = {t.id: t for t in processor_txns}
-
-        # 3. Find discrepancies
-        discrepancies = []
-
-        # Transactions in our system but not in processor
-        for txn_id, our_txn in internal_by_id.items():
-            if txn_id not in processor_by_id:
-                discrepancies.append({
-                    'type': 'MISSING_IN_PROCESSOR',
-                    'transaction': our_txn
-                })
-            else:
-                proc_txn = processor_by_id[txn_id]
-                if our_txn.amount != proc_txn.amount:
-                    discrepancies.append({
-                        'type': 'AMOUNT_MISMATCH',
-                        'internal': our_txn,
-                        'processor': proc_txn
-                    })
-
-        # Transactions in processor but not in our system
-        for txn_id, proc_txn in processor_by_id.items():
-            if txn_id not in internal_by_id:
-                discrepancies.append({
-                    'type': 'MISSING_IN_INTERNAL',
-                    'transaction': proc_txn
-                })
-
-        # 4. Generate report and alerts
-        if discrepancies:
-            self.alert_finance_team(discrepancies)
-
-        return ReconciliationReport(
-            date=date,
-            internal_count=len(internal_txns),
-            processor_count=len(processor_txns),
-            discrepancies=discrepancies
-        )
+*Daily Process (runs at end of each day):*
 ```
+Step 1: Get OUR records
+  SELECT all payments from today WHERE status = CAPTURED or SETTLED
+
+Step 2: Get PROCESSOR's settlement report
+  Download from Visa/Mastercard API
+
+Step 3: Compare and find discrepancies
+
+  FOR each of our transactions:
+    IF not in processor's report → flag "MISSING_IN_PROCESSOR"
+    IF amounts don't match → flag "AMOUNT_MISMATCH"
+
+  FOR each processor transaction:
+    IF not in our records → flag "MISSING_IN_INTERNAL"
+
+Step 4: Alert finance team if any discrepancies found
+```
+
+*Common Discrepancies:*
+- MISSING_IN_PROCESSOR: We think it succeeded, they say it didn't (lost transaction)
+- MISSING_IN_INTERNAL: They have record we don't (system bug)
+- AMOUNT_MISMATCH: Currency conversion difference, partial capture
 
 **PCI DSS Compliance Architecture:**
 ```
@@ -2290,343 +1910,202 @@ Fencing tokens:     64-bit monotonic counter per lock
 **Key Components**
 
 *Lock Data Structure:*
-```python
-@dataclass
-class Lock:
-    name: str                    # Lock identifier
-    owner: str                   # Client ID holding the lock
-    token: int                   # Fencing token (monotonic)
-    acquired_at: float           # Timestamp when acquired
-    ttl_ms: int                  # Time-to-live in milliseconds
+```
+Lock {
+    name:        "resource-123"        // Lock identifier
+    owner:       "client-abc"          // Who holds the lock
+    token:       42                    // Fencing token (monotonically increasing)
+    acquired_at: 1704067200000         // When acquired (epoch ms)
+    ttl_ms:      30000                 // Expires in 30 seconds
+}
 
-    def is_expired(self):
-        return time.time() * 1000 > self.acquired_at + self.ttl_ms
-
-    def remaining_ttl(self):
-        return max(0, (self.acquired_at + self.ttl_ms) - time.time() * 1000)
+is_expired = current_time > acquired_at + ttl_ms
+remaining_ttl = MAX(0, acquired_at + ttl_ms - current_time)
 ```
 
 **Single-Node Lock Manager:**
-```python
-class LockManager:
-    def __init__(self):
-        self.locks = {}           # name -> Lock
-        self.token_counter = 0    # Monotonic fencing token generator
-        self.lock = threading.Lock()
 
-    def acquire(self, lock_name, client_id, ttl_ms=30000):
-        """Try to acquire lock, return (success, token, ttl_remaining)"""
-        with self.lock:
-            current = self.locks.get(lock_name)
+*Acquire Lock:*
+```
+INPUT: lock_name, client_id, ttl_ms (default 30s)
 
-            # Check if lock exists and is not expired
-            if current and not current.is_expired():
-                if current.owner == client_id:
-                    # Re-entrant: extend TTL, return same token
-                    current.acquired_at = time.time() * 1000
-                    current.ttl_ms = ttl_ms
-                    return True, current.token, ttl_ms
-                else:
-                    # Lock held by another client
-                    return False, None, current.remaining_ttl()
+1. CHECK if lock exists and not expired:
+   IF lock exists AND not expired:
+       IF owner == client_id:
+           // Re-entrant: same client, extend TTL
+           RESET acquired_at to now
+           RETURN success, same token
+       ELSE:
+           // Someone else holds it
+           RETURN failure, remaining_ttl
 
-            # Lock available - acquire it
-            self.token_counter += 1
-            new_lock = Lock(
-                name=lock_name,
-                owner=client_id,
-                token=self.token_counter,
-                acquired_at=time.time() * 1000,
-                ttl_ms=ttl_ms
-            )
-            self.locks[lock_name] = new_lock
-            return True, new_lock.token, ttl_ms
+2. Lock is available (doesn't exist or expired):
+   INCREMENT global token counter (ensures monotonic tokens)
+   CREATE new lock with client as owner
+   RETURN success, new token
 
-    def release(self, lock_name, client_id, token):
-        """Release lock only if caller owns it with correct token"""
-        with self.lock:
-            current = self.locks.get(lock_name)
-            if not current:
-                return True  # Already released
+Token: 40 → 41 → 42 → ... (never decreases)
+```
 
-            if current.owner != client_id:
-                return False  # Not the owner
+*Release Lock:*
+```
+INPUT: lock_name, client_id, token
 
-            if current.token != token:
-                return False  # Stale token (lock was re-acquired)
+1. IF lock doesn't exist: return success (already released)
+2. IF owner ≠ client_id: return failure (not your lock)
+3. IF token ≠ lock's token: return failure (stale token)
+4. DELETE lock, return success
+```
 
-            del self.locks[lock_name]
-            return True
+*Extend Lock:*
+```
+INPUT: lock_name, client_id, token, new_ttl_ms
 
-    def extend(self, lock_name, client_id, token, ttl_ms):
-        """Extend lock TTL if caller still owns it"""
-        with self.lock:
-            current = self.locks.get(lock_name)
-            if not current or current.owner != client_id or current.token != token:
-                return False, 0
-
-            if current.is_expired():
-                return False, 0  # Too late, lock expired
-
-            current.acquired_at = time.time() * 1000
-            current.ttl_ms = ttl_ms
-            return True, ttl_ms
+1. VERIFY: lock exists, owner matches, token matches, not expired
+2. IF any check fails: return failure
+3. RESET acquired_at to now, update ttl_ms
+4. RETURN success
 ```
 
 **Redlock Algorithm (Distributed, Multi-Master):**
-```python
-class RedlockClient:
-    """
-    Redlock: Acquire lock on majority of independent Redis nodes.
-    Tolerates up to (N-1)/2 node failures.
-    """
-    def __init__(self, nodes, quorum=None):
-        self.nodes = nodes  # List of Redis connections
-        self.quorum = quorum or (len(nodes) // 2 + 1)
-        self.clock_drift_factor = 0.01  # 1% clock drift allowance
 
-    def acquire(self, lock_name, ttl_ms=30000):
-        """
-        Try to acquire lock on majority of nodes.
-        Returns (success, token, valid_until) or (False, None, None)
-        """
-        client_id = str(uuid.uuid4())
-        start_time = time.time() * 1000
+*Setup:* 5 independent Redis nodes, quorum = 3 (majority)
 
-        # Try to acquire on all nodes
-        acquired_count = 0
-        for node in self.nodes:
-            try:
-                # SET lock_name client_id NX PX ttl_ms
-                if node.set(lock_name, client_id, nx=True, px=ttl_ms):
-                    acquired_count += 1
-            except Exception:
-                continue  # Node unavailable, skip
+*Acquire Lock:*
+```
+1. Generate unique client_id (UUID)
+2. Record start_time
 
-        # Calculate elapsed time and remaining validity
-        elapsed = time.time() * 1000 - start_time
-        drift = ttl_ms * self.clock_drift_factor + 2  # Clock drift allowance
-        validity = ttl_ms - elapsed - drift
+3. FOR each of 5 Redis nodes:
+   TRY: SET lock_name client_id NX PX ttl_ms
+        (NX = only if not exists, PX = expire in ms)
+   IF success: acquired_count++
+   IF node down: skip (continue to next)
 
-        # Check if we got quorum and lock is still valid
-        if acquired_count >= self.quorum and validity > 0:
-            return True, client_id, start_time + validity
+4. CALCULATE validity:
+   elapsed = now - start_time
+   clock_drift = ttl_ms × 1% + 2ms   (safety margin)
+   validity = ttl_ms - elapsed - clock_drift
 
-        # Failed to get quorum - release all acquired locks
-        self._release_all(lock_name, client_id)
-        return False, None, None
+5. IF acquired_count >= 3 AND validity > 0:
+   // Got quorum and lock hasn't expired
+   RETURN success, client_id, valid_until
 
-    def release(self, lock_name, client_id):
-        """Release lock on all nodes"""
-        self._release_all(lock_name, client_id)
+6. ELSE:
+   // Failed - release all locks we acquired
+   FOR each node: DELETE lock_name IF value == client_id
+   RETURN failure
+```
 
-    def _release_all(self, lock_name, client_id):
-        """Release lock on all nodes (only if we own it)"""
-        # Lua script: atomic check-and-delete
-        release_script = """
-        if redis.call("GET", KEYS[1]) == ARGV[1] then
-            return redis.call("DEL", KEYS[1])
-        else
-            return 0
-        end
-        """
-        for node in self.nodes:
-            try:
-                node.eval(release_script, 1, lock_name, client_id)
-            except Exception:
-                continue
+*Release Lock:*
+```
+FOR each Redis node:
+    Atomically: IF GET(lock_name) == client_id THEN DELETE
+```
 
-    def acquire_with_retry(self, lock_name, ttl_ms=30000,
-                           max_retries=3, retry_delay_ms=200):
-        """Acquire with exponential backoff retry"""
-        for attempt in range(max_retries):
-            success, token, valid_until = self.acquire(lock_name, ttl_ms)
-            if success:
-                return success, token, valid_until
-
-            # Random delay to avoid thundering herd
-            delay = retry_delay_ms * (2 ** attempt) + random.randint(0, 100)
-            time.sleep(delay / 1000)
-
-        return False, None, None
+*Retry with Backoff:*
+```
+FOR attempt = 0 to max_retries:
+    TRY acquire
+    IF success: return
+    delay = 200ms × (2^attempt) + random(0-100ms)
+    SLEEP(delay)
 ```
 
 **Fencing Tokens (Prevent Stale Client Writes):**
-```python
-class FencedResource:
-    """
-    Resource that rejects operations from stale lock holders.
-    Fencing token is monotonically increasing - higher token wins.
-    """
-    def __init__(self):
-        self.last_token = 0
-        self.lock = threading.Lock()
 
-    def write(self, data, fencing_token):
-        """
-        Write data only if fencing_token is >= last seen token.
-        Prevents writes from clients whose lock expired and was re-acquired.
-        """
-        with self.lock:
-            if fencing_token < self.last_token:
-                raise StaleTokenError(
-                    f"Token {fencing_token} is stale, current is {self.last_token}"
-                )
-            self.last_token = fencing_token
-            self._do_write(data)
-            return True
+*The Problem:*
+```
+1. Client A acquires lock, gets token=42
+2. Client A pauses (GC pause, network delay)
+3. Lock expires
+4. Client B acquires lock, gets token=43
+5. Client A wakes up, thinks it still has lock
+6. Both A and B try to write → DATA CORRUPTION
+```
 
-# Usage pattern:
-# 1. Acquire lock, get fencing token
-# 2. Pass fencing token to all protected resources
-# 3. Resources reject operations with old tokens
+*The Solution:* Resources check token before accepting writes
+```
+Resource stores: last_seen_token = 0
 
-def safe_critical_section(lock_service, resource, lock_name):
-    success, token, valid_until = lock_service.acquire(lock_name)
-    if not success:
-        raise LockNotAcquiredError()
+ON write(data, fencing_token):
+    IF fencing_token < last_seen_token:
+        REJECT "stale token"
+    last_seen_token = fencing_token
+    PERFORM write
+```
 
-    try:
-        # Token protects against GC pauses, network delays, etc.
-        resource.write({"data": "value"}, fencing_token=token)
-    finally:
-        lock_service.release(lock_name, token)
+*Example:*
+```
+Client A (token=42) writes → accepted, last_seen=42
+Client A pauses, lock expires
+Client B (token=43) writes → accepted, last_seen=43
+Client A wakes, tries to write with token=42 → REJECTED (42 < 43)
 ```
 
 **Raft-Based Lock Service (Consensus Approach):**
-```python
-class RaftLockService:
-    """
-    Lock service using Raft consensus (like Chubby, etcd, ZooKeeper).
-    Single leader handles all requests - provides linearizable operations.
-    """
-    def __init__(self, raft_cluster):
-        self.raft = raft_cluster  # Raft consensus module
-        self.locks = {}           # Replicated state machine
-        self.sessions = {}        # Client sessions with keepalive
 
-    def acquire(self, session_id, lock_name, ttl_ms):
-        """Acquire lock - must go through Raft log"""
-        if not self.raft.is_leader():
-            # Redirect to leader
-            return self.raft.get_leader().acquire(session_id, lock_name, ttl_ms)
-
-        # Create log entry
-        entry = {
-            'type': 'ACQUIRE',
-            'session_id': session_id,
-            'lock_name': lock_name,
-            'ttl_ms': ttl_ms,
-            'timestamp': time.time()
-        }
-
-        # Replicate through Raft (blocks until committed)
-        result = self.raft.replicate(entry)
-        return result
-
-    def apply(self, entry):
-        """Apply committed log entry to state machine"""
-        if entry['type'] == 'ACQUIRE':
-            return self._apply_acquire(entry)
-        elif entry['type'] == 'RELEASE':
-            return self._apply_release(entry)
-        elif entry['type'] == 'SESSION_EXPIRE':
-            return self._apply_session_expire(entry)
-
-    def _apply_acquire(self, entry):
-        lock_name = entry['lock_name']
-        session_id = entry['session_id']
-
-        current = self.locks.get(lock_name)
-        if current and not current.is_expired():
-            if current.session_id == session_id:
-                # Extend existing lock
-                current.ttl_ms = entry['ttl_ms']
-                current.acquired_at = entry['timestamp']
-                return True, current.token
-            return False, None  # Lock held by another session
-
-        # Grant new lock
-        token = self._next_token()
-        self.locks[lock_name] = Lock(
-            name=lock_name,
-            session_id=session_id,
-            token=token,
-            acquired_at=entry['timestamp'],
-            ttl_ms=entry['ttl_ms']
-        )
-        return True, token
+*How It Works:*
+```
+                    ┌─────────────┐
+    Clients ───────▶│   Leader    │◀──── All writes go through leader
+                    │   (Node 1)  │
+                    └──────┬──────┘
+                           │ Replicates via Raft
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+         ┌────────┐   ┌────────┐   ┌────────┐
+         │Follower│   │Follower│   │Follower│
+         │(Node 2)│   │(Node 3)│   │(Node 4)│
+         └────────┘   └────────┘   └────────┘
 ```
 
+*Acquire via Raft:*
+```
+1. IF not leader: redirect client to leader
+
+2. CREATE log entry: {type: ACQUIRE, session_id, lock_name, ttl_ms}
+
+3. REPLICATE through Raft consensus (waits for majority)
+
+4. APPLY to state machine:
+   IF lock held by another session: return failure
+   IF lock held by same session: extend TTL
+   IF lock available: create lock, assign token
+```
+
+*Benefits over Redlock:* Linearizable (strongest consistency), survives up to N/2 failures
+
 **Lock Client with Auto-Renewal:**
-```python
-class DistributedLockClient:
-    def __init__(self, lock_service, renewal_interval_ms=10000):
-        self.lock_service = lock_service
-        self.renewal_interval = renewal_interval_ms
-        self.active_locks = {}  # lock_name -> (token, renewal_thread)
 
-    def acquire(self, lock_name, ttl_ms=30000, blocking=True, timeout=None):
-        """Acquire lock with automatic renewal"""
-        start = time.time()
+```
+ON acquire(lock_name, ttl=30s, blocking=true):
+    WHILE true:
+        TRY acquire lock from service
+        IF success:
+            START background thread: renewal_loop(lock_name, token, ttl)
+            RETURN lock handle
+        IF not blocking: return null
+        IF timeout reached: throw error
+        SLEEP 100ms
 
-        while True:
-            success, token, _ = self.lock_service.acquire(lock_name, ttl_ms)
+RENEWAL LOOP (runs in background):
+    EVERY 10 seconds (before 30s TTL expires):
+        TRY extend lock TTL
+        IF failed: lock was lost, notify application
 
-            if success:
-                # Start renewal thread
-                renewal_thread = threading.Thread(
-                    target=self._renewal_loop,
-                    args=(lock_name, token, ttl_ms),
-                    daemon=True
-                )
-                renewal_thread.start()
-                self.active_locks[lock_name] = (token, renewal_thread)
-                return LockHandle(self, lock_name, token)
+ON release:
+    STOP renewal thread
+    CALL service.release(lock_name, token)
+```
 
-            if not blocking:
-                return None
-
-            if timeout and (time.time() - start) > timeout:
-                raise LockTimeoutError(f"Could not acquire {lock_name}")
-
-            time.sleep(0.1)  # Brief sleep before retry
-
-    def _renewal_loop(self, lock_name, token, ttl_ms):
-        """Background thread to renew lock before expiry"""
-        while lock_name in self.active_locks:
-            time.sleep(self.renewal_interval / 1000)
-
-            if lock_name not in self.active_locks:
-                break
-
-            success, _ = self.lock_service.extend(lock_name, token, ttl_ms)
-            if not success:
-                # Lock lost - notify application
-                self._on_lock_lost(lock_name)
-                break
-
-    def release(self, lock_name, token):
-        """Release lock and stop renewal"""
-        if lock_name in self.active_locks:
-            del self.active_locks[lock_name]
-        self.lock_service.release(lock_name, token)
-
-class LockHandle:
-    """Context manager for automatic lock release"""
-    def __init__(self, client, lock_name, token):
-        self.client = client
-        self.lock_name = lock_name
-        self.token = token
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.client.release(self.lock_name, self.token)
-        return False
-
-# Usage:
+*Context Manager Pattern:*
+```
+WITH lock_client.acquire("resource-123") as lock:
+    // do critical section work
+    // lock automatically released when block exits
+    // (even if exception thrown)
+```
 # with lock_client.acquire("resource:123") as lock:
 #     do_critical_section()
 ```
@@ -2699,381 +2178,164 @@ Typical query:      5km radius, return top 20 results
 **Key Components**
 
 *Approach 1: Geohash-Based Indexing:*
-```python
-class GeohashIndex:
-    """
-    Geohash divides Earth into grid cells with hierarchical precision.
-    Nearby points share common prefix in their geohash.
 
-    Precision levels:
-    1: ±2500 km  (5 bits)
-    4: ±20 km    (20 bits)
-    6: ±0.6 km   (30 bits)
-    8: ±19 m     (40 bits)
-    """
+**How Geohash Works:**
+- Divides Earth into grid cells with hierarchical precision
+- Nearby points share common prefix in their geohash string
+- Precision levels: 1 char = ±2500 km, 4 chars = ±20 km, 6 chars = ±0.6 km, 8 chars = ±19 m
 
-    BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz'
+**Encoding Algorithm:**
+```
+To encode (latitude, longitude) to geohash string:
+  1. Start with full lat range [-90, 90] and lng range [-180, 180]
+  2. Alternate between longitude and latitude bits
+  3. For each bit:
+     - Calculate midpoint of current range
+     - If coordinate >= midpoint: set bit to 1, use upper half
+     - Otherwise: set bit to 0, use lower half
+  4. Every 5 bits, convert to Base32 character
+  5. Repeat until reaching desired precision
 
-    def encode(self, lat, lng, precision=6):
-        """Encode lat/lng to geohash string"""
-        lat_range = (-90.0, 90.0)
-        lng_range = (-180.0, 180.0)
-        geohash = []
-        bits = 0
-        bit = 0
-        ch = 0
-        even = True
+Get neighbors: Return 8 adjacent cells (N, NE, E, SE, S, SW, W, NW)
+              Handle wraparound at date line and poles
+```
 
-        while len(geohash) < precision:
-            if even:  # Longitude
-                mid = (lng_range[0] + lng_range[1]) / 2
-                if lng >= mid:
-                    ch |= (1 << (4 - bit))
-                    lng_range = (mid, lng_range[1])
-                else:
-                    lng_range = (lng_range[0], mid)
-            else:  # Latitude
-                mid = (lat_range[0] + lat_range[1]) / 2
-                if lat >= mid:
-                    ch |= (1 << (4 - bit))
-                    lat_range = (mid, lat_range[1])
-                else:
-                    lat_range = (lat_range[0], mid)
+**Geohash Proximity Search:**
+```
+ADD BUSINESS:
+  1. Encode lat/lng to geohash (precision 6 = ~600m cells)
+  2. Store in Redis:
+     - GEOADD for Redis native geo queries
+     - SADD to "businesses:geohash:{hash}" for fast cell lookup
+     - HSET business data (lat, lng, details)
 
-            even = not even
-            bit += 1
+SEARCH NEARBY:
+  1. Choose precision based on radius:
+     - >100 km → precision 3 (~78 km cells)
+     - >10 km  → precision 4 (~20 km cells)
+     - >1 km   → precision 5 (~2.4 km cells)
+     - else    → precision 6 (~0.6 km cells)
+  2. Encode search center to geohash
+  3. Get center cell + 8 neighbors (9 cells total)
+  4. Collect all businesses from these cells (candidates)
+  5. Filter candidates by exact haversine distance
+  6. Sort by distance, return top N
 
-            if bit == 5:
-                geohash.append(self.BASE32[ch])
-                bit = 0
-                ch = 0
-
-        return ''.join(geohash)
-
-    def get_neighbors(self, geohash):
-        """Get 8 neighboring geohash cells (for edge cases)"""
-        # Returns adjacent cells: N, NE, E, SE, S, SW, W, NW
-        # Implementation handles wraparound at edges
-        neighbors = []
-        for dlat in [-1, 0, 1]:
-            for dlng in [-1, 0, 1]:
-                if dlat == 0 and dlng == 0:
-                    continue
-                neighbors.append(self._neighbor(geohash, dlat, dlng))
-        return neighbors
-
-class GeohashProximitySearch:
-    def __init__(self, redis_client):
-        self.redis = redis_client
-        self.geohash = GeohashIndex()
-
-    def add_business(self, business_id, lat, lng, data):
-        """Index business by geohash"""
-        # Use precision 6 (~600m cells) for nearby searches
-        gh = self.geohash.encode(lat, lng, precision=6)
-
-        # Store in Redis sorted set (score = geohash prefix for range queries)
-        self.redis.geoadd("businesses:geo", lng, lat, business_id)
-
-        # Also store by geohash prefix for fast lookup
-        self.redis.sadd(f"businesses:geohash:{gh}", business_id)
-
-        # Store business data
-        self.redis.hset(f"business:{business_id}", mapping={
-            'lat': lat, 'lng': lng, 'data': json.dumps(data)
-        })
-
-    def search_nearby(self, lat, lng, radius_km, limit=20):
-        """Find businesses within radius"""
-        # Determine geohash precision based on radius
-        precision = self._radius_to_precision(radius_km)
-        center_hash = self.geohash.encode(lat, lng, precision)
-
-        # Get center cell + neighbors (9 cells total)
-        cells = [center_hash] + self.geohash.get_neighbors(center_hash)
-
-        # Collect candidate businesses from all cells
-        candidates = []
-        for cell in cells:
-            # Get all businesses in this cell
-            business_ids = self.redis.smembers(f"businesses:geohash:{cell}")
-            for bid in business_ids:
-                biz = self.redis.hgetall(f"business:{bid}")
-                candidates.append((bid, float(biz['lat']), float(biz['lng'])))
-
-        # Filter by exact distance and sort
-        results = []
-        for bid, blat, blng in candidates:
-            dist = self._haversine(lat, lng, blat, blng)
-            if dist <= radius_km:
-                results.append((bid, dist))
-
-        results.sort(key=lambda x: x[1])
-        return results[:limit]
-
-    def _haversine(self, lat1, lng1, lat2, lng2):
-        """Calculate distance between two points in km"""
-        R = 6371  # Earth's radius in km
-        dlat = math.radians(lat2 - lat1)
-        dlng = math.radians(lng2 - lng1)
-        a = (math.sin(dlat/2)**2 +
-             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-             math.sin(dlng/2)**2)
-        c = 2 * math.asin(math.sqrt(a))
-        return R * c
-
-    def _radius_to_precision(self, radius_km):
-        """Choose geohash precision based on search radius"""
-        if radius_km > 100:
-            return 3   # ~78km cells
-        elif radius_km > 10:
-            return 4   # ~20km cells
-        elif radius_km > 1:
-            return 5   # ~2.4km cells
-        else:
-            return 6   # ~0.6km cells
+HAVERSINE DISTANCE:
+  - Uses spherical Earth model (radius = 6371 km)
+  - Accounts for Earth's curvature
+  - Formula: distance = 2 * R * arcsin(sqrt(a))
+    where a depends on lat/lng differences
 ```
 
 *Approach 2: QuadTree (In-Memory):*
-```python
-class QuadTree:
-    """
-    Recursively divide 2D space into 4 quadrants.
-    Each node holds points until capacity, then splits.
 
-    Good for: non-uniform distribution, dynamic updates
-    Query time: O(log n) average
-    """
+**QuadTree Concept:**
+- Recursively divides 2D space into 4 quadrants (NW, NE, SW, SE)
+- Each node holds points until capacity reached, then splits
+- Good for: non-uniform distribution, dynamic updates
+- Query time: O(log n) average
 
-    def __init__(self, boundary, capacity=4):
-        self.boundary = boundary  # (x, y, width, height)
-        self.capacity = capacity
-        self.points = []          # [(id, x, y, data), ...]
-        self.divided = False
-        self.nw = self.ne = self.sw = self.se = None
+**QuadTree Structure:**
+```
+Each node contains:
+  - boundary: rectangle (x, y, width, height)
+  - capacity: max points before splitting (e.g., 4-100)
+  - points: list of (id, x, y, data) tuples
+  - children: NW, NE, SW, SE (null until split)
 
-    def insert(self, point_id, x, y, data=None):
-        """Insert a point into the quadtree"""
-        if not self._contains(x, y):
-            return False
+INSERT:
+  1. If point outside this node's boundary → reject
+  2. If room in this node and not yet split → add point here
+  3. Otherwise:
+     a. If not split yet → subdivide into 4 children
+        (re-insert existing points into appropriate children)
+     b. Insert into whichever child contains the point
 
-        if len(self.points) < self.capacity and not self.divided:
-            self.points.append((point_id, x, y, data))
-            return True
+SUBDIVIDE:
+  Split boundary into 4 equal rectangles:
+  - NW: upper-left quarter
+  - NE: upper-right quarter
+  - SW: lower-left quarter
+  - SE: lower-right quarter
+  Move all points from parent to appropriate children
 
-        if not self.divided:
-            self._subdivide()
+RADIUS QUERY:
+  1. If this node's boundary doesn't intersect search circle → skip entirely
+  2. Check all points in this node, add those within radius
+  3. Recursively query all children (if split)
 
-        # Insert into appropriate quadrant
-        return (self.nw.insert(point_id, x, y, data) or
-                self.ne.insert(point_id, x, y, data) or
-                self.sw.insert(point_id, x, y, data) or
-                self.se.insert(point_id, x, y, data))
+  Circle-rectangle intersection: find closest point on rectangle to circle center,
+  check if distance to that point ≤ radius
+```
 
-    def _subdivide(self):
-        """Split node into 4 quadrants"""
-        x, y, w, h = self.boundary
-        hw, hh = w / 2, h / 2
+**QuadTree Proximity Service:**
+```
+SETUP:
+  - Create tree covering world: lng [-180, 180], lat [-90, 90]
+  - Maintain separate map of id → full business data
 
-        self.nw = QuadTree((x, y + hh, hw, hh), self.capacity)
-        self.ne = QuadTree((x + hw, y + hh, hw, hh), self.capacity)
-        self.sw = QuadTree((x, y, hw, hh), self.capacity)
-        self.se = QuadTree((x + hw, y, hw, hh), self.capacity)
-        self.divided = True
+ADD BUSINESS:
+  - Store full data in map
+  - Insert (id, lng, lat) into quadtree
 
-        # Re-insert existing points into children
-        for pid, px, py, data in self.points:
-            self._insert_into_children(pid, px, py, data)
-        self.points = []
-
-    def query_radius(self, cx, cy, radius):
-        """Find all points within radius of (cx, cy)"""
-        results = []
-        self._query_radius(cx, cy, radius, results)
-        return results
-
-    def _query_radius(self, cx, cy, radius, results):
-        """Recursive radius query"""
-        # Skip if this quadrant doesn't intersect the search circle
-        if not self._intersects_circle(cx, cy, radius):
-            return
-
-        # Check points in this node
-        for pid, px, py, data in self.points:
-            dist = math.sqrt((px - cx)**2 + (py - cy)**2)
-            if dist <= radius:
-                results.append((pid, px, py, dist, data))
-
-        # Recurse into children
-        if self.divided:
-            self.nw._query_radius(cx, cy, radius, results)
-            self.ne._query_radius(cx, cy, radius, results)
-            self.sw._query_radius(cx, cy, radius, results)
-            self.se._query_radius(cx, cy, radius, results)
-
-    def _intersects_circle(self, cx, cy, radius):
-        """Check if this quadrant intersects the search circle"""
-        x, y, w, h = self.boundary
-        # Find closest point on rectangle to circle center
-        closest_x = max(x, min(cx, x + w))
-        closest_y = max(y, min(cy, y + h))
-        dist = math.sqrt((closest_x - cx)**2 + (closest_y - cy)**2)
-        return dist <= radius
-
-    def _contains(self, x, y):
-        bx, by, w, h = self.boundary
-        return bx <= x < bx + w and by <= y < by + h
-
-class QuadTreeProximityService:
-    def __init__(self):
-        # Cover entire world: lng [-180, 180], lat [-90, 90]
-        self.tree = QuadTree((-180, -90, 360, 180), capacity=100)
-        self.businesses = {}  # id -> full business data
-
-    def add_business(self, business):
-        self.businesses[business.id] = business
-        # Note: QuadTree uses flat coordinates; for accuracy,
-        # convert to projected coordinates or use haversine for distance
-        self.tree.insert(business.id, business.lng, business.lat, None)
-
-    def search_nearby(self, lat, lng, radius_km, filters=None, limit=20):
-        # Convert km to degrees (approximate)
-        radius_deg = radius_km / 111.0  # 1 degree ≈ 111 km
-
-        candidates = self.tree.query_radius(lng, lat, radius_deg)
-
-        # Apply filters and calculate exact distance
-        results = []
-        for pid, px, py, _, _ in candidates:
-            biz = self.businesses[pid]
-
-            # Apply filters
-            if filters:
-                if not self._matches_filters(biz, filters):
-                    continue
-
-            # Calculate exact distance using haversine
-            dist = self._haversine(lat, lng, biz.lat, biz.lng)
-            if dist <= radius_km:
-                results.append((biz, dist))
-
-        # Sort by distance
-        results.sort(key=lambda x: x[1])
-        return results[:limit]
+SEARCH NEARBY:
+  1. Convert radius from km to degrees (~111 km per degree)
+  2. Query tree for candidates within radius
+  3. Apply business filters (category, rating, etc.)
+  4. Calculate exact distance using haversine formula
+  5. Filter to those truly within radius
+  6. Sort by distance, return top N
 ```
 
 *Approach 3: Google S2 Cells:*
-```python
-class S2ProximitySearch:
-    """
-    S2 Geometry: Projects Earth onto a cube, then uses Hilbert curve
-    for 1D ordering. Provides tight covering of arbitrary regions.
 
-    Advantages over geohash:
-    - No discontinuities at edges
-    - Better coverage of polar regions
-    - Variable-size cells for efficient covering
-    """
+**S2 Geometry Concept:**
+- Projects Earth onto a cube, then uses Hilbert curve for 1D ordering
+- Provides tight covering of arbitrary regions with variable-size cells
+- Advantages over geohash: no discontinuities at edges, better polar coverage
 
-    def __init__(self, db):
-        self.db = db  # Database with S2 cell index
+**S2 Proximity Search:**
+```
+SEARCH NEARBY:
+  1. Create spherical cap (circle on sphere) from center + radius
+     - Convert radius from km to radians: radius / 6371 (Earth's radius)
+  2. Get covering cells using S2 Region Coverer:
+     - Set max cells (e.g., 20) to limit query count
+     - Set min level (e.g., 10 = ~10 km) and max level (e.g., 16 = ~150 m)
+     - Coverer returns minimal set of cells that fully cover the circle
+  3. For each covering cell, do database range query:
+     - "SELECT * FROM businesses WHERE s2_cell BETWEEN cell_min AND cell_max"
+     - S2 cells are hierarchical: all children share parent prefix
+  4. Filter candidates by exact haversine distance
+  5. Sort by distance, return top N
 
-    def search_nearby(self, lat, lng, radius_km, limit=20):
-        # Create S2 point for center
-        center = s2.S2LatLng.FromDegrees(lat, lng).ToPoint()
-
-        # Create spherical cap (circle on sphere)
-        radius_radians = radius_km / 6371.0  # Earth radius in km
-        cap = s2.S2Cap.FromCenterAngle(center, s2.S1Angle.Radians(radius_radians))
-
-        # Get covering cells at appropriate level
-        coverer = s2.S2RegionCoverer()
-        coverer.set_max_cells(20)        # Limit cell count for query efficiency
-        coverer.set_min_level(10)         # ~10km cells
-        coverer.set_max_level(16)         # ~150m cells
-
-        covering = coverer.GetCovering(cap)
-
-        # Query database for each covering cell
-        candidates = []
-        for cell_id in covering:
-            # Range query: all cells that start with this prefix
-            cell_range = self._get_cell_range(cell_id)
-            results = self.db.query(
-                "SELECT * FROM businesses WHERE s2_cell BETWEEN ? AND ?",
-                cell_range
-            )
-            candidates.extend(results)
-
-        # Filter by exact distance
-        results = []
-        for biz in candidates:
-            dist = self._haversine(lat, lng, biz.lat, biz.lng)
-            if dist <= radius_km:
-                results.append((biz, dist))
-
-        results.sort(key=lambda x: x[1])
-        return results[:limit]
-
-    def add_business(self, business):
-        # Calculate S2 cell at leaf level (level 30)
-        point = s2.S2LatLng.FromDegrees(business.lat, business.lng)
-        cell = s2.S2CellId.FromLatLng(point)
-
-        # Store with cell ID for range queries
-        self.db.insert(
-            "INSERT INTO businesses (id, lat, lng, s2_cell, data) VALUES (?, ?, ?, ?, ?)",
-            (business.id, business.lat, business.lng, cell.id(), business.data)
-        )
+ADD BUSINESS:
+  - Calculate S2 cell at leaf level (level 30 = finest granularity)
+  - Store business with cell ID in database
+  - Index on s2_cell column for efficient range queries
 ```
 
 **Sharding Strategy:**
-```python
-class ShardedProximityService:
-    """
-    Shard businesses by geographic region for horizontal scaling.
-    Each shard handles a contiguous region (e.g., city, country).
-    """
+```
+CONCEPT:
+  - Shard businesses by geographic region for horizontal scaling
+  - Each shard handles a contiguous region (e.g., city, country, continent)
+  - Shards map to geohash prefixes (precision 2 = ~600 km regions)
 
-    def __init__(self, shards):
-        # shards: {region_id: (geohash_prefix, shard_connection)}
-        self.shards = shards
-        self.region_index = self._build_region_index()
+SEARCH NEARBY:
+  1. Encode search center to low-precision geohash (precision 2)
+  2. Identify which shards cover this region
+  3. If radius is large (>50 km), include neighboring regions too
+  4. Query all relevant shards in PARALLEL
+  5. Merge results from all shards
+  6. Sort merged results by distance, return top N
 
-    def search_nearby(self, lat, lng, radius_km, limit=20):
-        # Determine which shards to query
-        center_geohash = encode_geohash(lat, lng, precision=2)  # ~600km
-        relevant_shards = self._get_shards_for_region(center_geohash, radius_km)
-
-        # Query all relevant shards in parallel
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for shard in relevant_shards:
-                futures.append(
-                    executor.submit(shard.search_nearby, lat, lng, radius_km, limit)
-                )
-
-            # Merge results
-            all_results = []
-            for future in futures:
-                all_results.extend(future.result())
-
-        # Sort merged results by distance
-        all_results.sort(key=lambda x: x[1])
-        return all_results[:limit]
-
-    def _get_shards_for_region(self, center_geohash, radius_km):
-        """Find all shards that may contain results"""
-        shards = set()
-        shards.add(self.region_index[center_geohash])
-
-        # If radius is large, include neighboring regions
-        if radius_km > 50:  # Crosses region boundaries
-            for neighbor in get_geohash_neighbors(center_geohash):
-                if neighbor in self.region_index:
-                    shards.add(self.region_index[neighbor])
-
-        return list(shards)
+FIND RELEVANT SHARDS:
+  - Start with shard for center geohash
+  - If search radius might cross region boundaries:
+    - Add shards for all 8 neighboring geohash cells
+  - Return deduplicated list of shards to query
 ```
 
 **Deep Dive**
@@ -3141,408 +2403,149 @@ Node ID:            1024 nodes (10 bits)
 **Key Components**
 
 **Snowflake ID Generator:**
-```python
-class SnowflakeGenerator:
-    """
-    Twitter Snowflake-style 64-bit ID generator.
 
-    Bit allocation:
-    - 1 bit:  Sign (always 0 for positive)
-    - 41 bits: Timestamp (milliseconds since custom epoch)
-    - 10 bits: Node/Machine ID (0-1023)
-    - 12 bits: Sequence number (0-4095 per millisecond)
+**Core Algorithm:**
+```
+CONFIGURATION:
+  - EPOCH: Custom start time (e.g., 2020-01-01) to maximize timestamp range
+  - Bit allocation: 1 sign + 41 timestamp + 10 node + 12 sequence = 64 bits
+  - Max values: node_id 0-1023, sequence 0-4095 per millisecond
 
-    Properties:
-    - Time-ordered: IDs generated later have higher values
-    - Unique: Node ID + sequence ensures uniqueness within millisecond
-    - No coordination: Each node generates independently
-    """
+STATE:
+  - node_id: Unique identifier for this generator instance
+  - sequence: Counter within current millisecond
+  - last_timestamp: Previous generation time
+  - lock: Mutex for thread safety
 
-    # Custom epoch: 2020-01-01 00:00:00 UTC
-    EPOCH = 1577836800000
+GENERATE ID:
+  1. Acquire lock (thread-safe)
+  2. Get current timestamp in milliseconds
+  3. Check for clock going backwards:
+     - If current < last → ERROR (clock moved backwards!)
+  4. Handle same-millisecond case:
+     - Increment sequence (0 → 1 → 2 ... → 4095)
+     - If sequence overflows (wraps to 0):
+       - Spin-wait until next millisecond
+  5. Handle new-millisecond case:
+     - Reset sequence to 0
+  6. Compose 64-bit ID:
+     - ID = (timestamp - EPOCH) << 22  |  node_id << 12  |  sequence
+  7. Return ID
 
-    # Bit lengths
-    TIMESTAMP_BITS = 41
-    NODE_ID_BITS = 10
-    SEQUENCE_BITS = 12
-
-    # Max values
-    MAX_NODE_ID = (1 << NODE_ID_BITS) - 1      # 1023
-    MAX_SEQUENCE = (1 << SEQUENCE_BITS) - 1     # 4095
-
-    # Bit shifts
-    TIMESTAMP_SHIFT = NODE_ID_BITS + SEQUENCE_BITS  # 22
-    NODE_ID_SHIFT = SEQUENCE_BITS                    # 12
-
-    def __init__(self, node_id):
-        if node_id < 0 or node_id > self.MAX_NODE_ID:
-            raise ValueError(f"Node ID must be between 0 and {self.MAX_NODE_ID}")
-
-        self.node_id = node_id
-        self.sequence = 0
-        self.last_timestamp = -1
-        self.lock = threading.Lock()
-
-    def generate(self):
-        """Generate next unique ID"""
-        with self.lock:
-            timestamp = self._current_time_ms()
-
-            if timestamp < self.last_timestamp:
-                # Clock moved backwards - this is a problem!
-                raise ClockMovedBackwardsError(
-                    f"Clock moved backwards by {self.last_timestamp - timestamp}ms"
-                )
-
-            if timestamp == self.last_timestamp:
-                # Same millisecond - increment sequence
-                self.sequence = (self.sequence + 1) & self.MAX_SEQUENCE
-
-                if self.sequence == 0:
-                    # Sequence exhausted for this millisecond - wait for next ms
-                    timestamp = self._wait_next_millis(self.last_timestamp)
-            else:
-                # New millisecond - reset sequence
-                self.sequence = 0
-
-            self.last_timestamp = timestamp
-
-            # Compose the 64-bit ID
-            id = ((timestamp - self.EPOCH) << self.TIMESTAMP_SHIFT) | \
-                 (self.node_id << self.NODE_ID_SHIFT) | \
-                 self.sequence
-
-            return id
-
-    def _current_time_ms(self):
-        return int(time.time() * 1000)
-
-    def _wait_next_millis(self, last_timestamp):
-        """Spin until clock advances to next millisecond"""
-        timestamp = self._current_time_ms()
-        while timestamp <= last_timestamp:
-            timestamp = self._current_time_ms()
-        return timestamp
-
-    def parse(self, id):
-        """Extract components from a Snowflake ID"""
-        timestamp = ((id >> self.TIMESTAMP_SHIFT) & ((1 << self.TIMESTAMP_BITS) - 1))
-        timestamp += self.EPOCH
-
-        node_id = (id >> self.NODE_ID_SHIFT) & self.MAX_NODE_ID
-        sequence = id & self.MAX_SEQUENCE
-
-        return {
-            'timestamp': timestamp,
-            'datetime': datetime.fromtimestamp(timestamp / 1000),
-            'node_id': node_id,
-            'sequence': sequence
-        }
+PARSE ID (extract components):
+  - timestamp = (ID >> 22) + EPOCH
+  - node_id = (ID >> 12) & 0x3FF  (10 bits)
+  - sequence = ID & 0xFFF  (12 bits)
 ```
 
 **Handling Clock Skew:**
-```python
-class RobustSnowflakeGenerator:
-    """
-    Enhanced Snowflake with clock skew handling.
-    """
+```
+ROBUST GENERATOR (tolerates small clock drift):
+  On clock backward detection:
+    - Calculate skew = last_timestamp - current_time
+    - If skew ≤ max_allowed (e.g., 5 seconds):
+      - Sleep for skew duration, then retry
+    - If skew > max_allowed:
+      - ERROR: Clock skew too large (system time may be misconfigured)
 
-    def __init__(self, node_id, max_clock_skew_ms=5000):
-        self.node_id = node_id
-        self.max_clock_skew_ms = max_clock_skew_ms
-        self.sequence = 0
-        self.last_timestamp = -1
-        self.lock = threading.Lock()
-
-    def generate(self):
-        with self.lock:
-            timestamp = self._current_time_ms()
-
-            if timestamp < self.last_timestamp:
-                skew = self.last_timestamp - timestamp
-
-                if skew <= self.max_clock_skew_ms:
-                    # Small skew: wait it out
-                    time.sleep(skew / 1000.0)
-                    timestamp = self._current_time_ms()
-                else:
-                    # Large skew: something seriously wrong
-                    raise ClockSkewTooLargeError(f"Clock skew of {skew}ms exceeds max")
-
-            # Rest of generation logic...
-            if timestamp == self.last_timestamp:
-                self.sequence = (self.sequence + 1) & SnowflakeGenerator.MAX_SEQUENCE
-                if self.sequence == 0:
-                    timestamp = self._wait_next_millis(self.last_timestamp)
-            else:
-                self.sequence = 0
-
-            self.last_timestamp = timestamp
-
-            return self._compose_id(timestamp, self.node_id, self.sequence)
-
-class LogicalClockSnowflake:
-    """
-    Alternative: Use logical timestamp that never goes backwards.
-    Trade-off: IDs may drift from wall clock during skew.
-    """
-
-    def __init__(self, node_id):
-        self.node_id = node_id
-        self.sequence = 0
-        self.logical_time = self._current_time_ms()
-        self.lock = threading.Lock()
-
-    def generate(self):
-        with self.lock:
-            wall_time = self._current_time_ms()
-
-            # Logical time = max(wall_time, last_logical_time)
-            self.logical_time = max(wall_time, self.logical_time)
-
-            self.sequence = (self.sequence + 1) & SnowflakeGenerator.MAX_SEQUENCE
-            if self.sequence == 0:
-                # Force logical time forward
-                self.logical_time += 1
-
-            return self._compose_id(self.logical_time, self.node_id, self.sequence)
+LOGICAL CLOCK APPROACH (alternative):
+  - Maintain logical_time = max(wall_time, last_logical_time)
+  - Never goes backwards by definition
+  - Trade-off: IDs may drift from wall clock during skew periods
+  - On sequence overflow: increment logical_time by 1
 ```
 
-**Node ID Assignment:**
-```python
-class NodeIDAssigner:
-    """
-    Strategies for assigning unique node IDs:
-    1. Static configuration (simplest, requires manual management)
-    2. ZooKeeper-based (automatic, survives restarts)
-    3. Database-based (simple coordination)
-    """
+**Node ID Assignment Strategies:**
+```
+STRATEGY 1: STATIC CONFIGURATION (simplest)
+  - Set node ID via config file or environment variable
+  - Pros: Simple, no external dependencies
+  - Cons: Manual management, risk of duplicates if misconfigured
 
-    # Strategy 1: Static from config/environment
-    @staticmethod
-    def from_config():
-        return int(os.environ['SNOWFLAKE_NODE_ID'])
+STRATEGY 2: ZOOKEEPER (automatic, survives restarts)
+  - Create ephemeral sequential node: /snowflake/service/nodes/node-
+  - ZooKeeper auto-appends sequence number: node-0000000042
+  - Extract sequence number as node ID (42)
+  - Ephemeral: node deleted when service disconnects → ID reusable
+  - Pros: Automatic, handles restarts
+  - Cons: Requires ZooKeeper cluster
 
-    # Strategy 2: ZooKeeper ephemeral sequential nodes
-    @staticmethod
-    def from_zookeeper(zk_client, service_name):
-        """
-        Create ephemeral sequential node in ZooKeeper.
-        Node ID = sequence number from ZK path.
-        """
-        path = f"/snowflake/{service_name}/nodes/node-"
-        created_path = zk_client.create(
-            path,
-            ephemeral=True,
-            sequence=True
-        )
-        # Extract sequence number: /snowflake/svc/nodes/node-0000000042 -> 42
-        node_id = int(created_path.split('-')[-1])
-
-        if node_id > SnowflakeGenerator.MAX_NODE_ID:
-            raise TooManyNodesError(f"Node ID {node_id} exceeds max")
-
-        return node_id
-
-    # Strategy 3: Database with lease
-    @staticmethod
-    def from_database(db, hostname, lease_duration_sec=300):
-        """
-        Claim a node ID from database with time-based lease.
-        """
-        # Try to claim an existing expired lease
-        result = db.execute("""
-            UPDATE node_leases
-            SET hostname = ?,
-                lease_until = NOW() + INTERVAL ? SECOND
-            WHERE lease_until < NOW()
-            ORDER BY node_id
-            LIMIT 1
-            RETURNING node_id
-        """, (hostname, lease_duration_sec))
-
-        if result:
-            return result['node_id']
-
-        # No expired leases - create new one if under limit
-        result = db.execute("""
-            INSERT INTO node_leases (hostname, lease_until)
-            SELECT ?, NOW() + INTERVAL ? SECOND
-            WHERE (SELECT COUNT(*) FROM node_leases) < 1024
-            RETURNING node_id
-        """, (hostname, lease_duration_sec))
-
-        if result:
-            return result['node_id']
-
-        raise NoNodeIDAvailableError("All 1024 node IDs are in use")
+STRATEGY 3: DATABASE WITH LEASE (simple coordination)
+  1. Try to claim an expired lease:
+     - UPDATE node_leases SET hostname=me, lease_until=now+5min
+       WHERE lease_until < NOW() LIMIT 1
+  2. If no expired lease, create new one:
+     - INSERT INTO node_leases (hostname, lease_until)
+       WHERE (SELECT COUNT(*) FROM node_leases) < 1024
+  3. Background thread: renew lease before expiry
+  - Pros: Uses existing database, no new infrastructure
+  - Cons: Slightly slower, lease renewal overhead
 ```
 
 **Datacenter-Aware Snowflake:**
-```python
-class DatacenterSnowflake:
-    """
-    Split node ID bits between datacenter and machine.
+```
+Bit allocation (splits 10-bit node ID):
+  - 41 bits: Timestamp
+  - 5 bits:  Datacenter ID (0-31)
+  - 5 bits:  Machine ID (0-31 per datacenter)
+  - 12 bits: Sequence
 
-    Bit allocation:
-    - 41 bits: Timestamp
-    - 5 bits:  Datacenter ID (0-31)
-    - 5 bits:  Machine ID (0-31 per datacenter)
-    - 12 bits: Sequence
+Total capacity: 32 datacenters × 32 machines = 1024 nodes
 
-    Total: 32 datacenters × 32 machines = 1024 nodes
-    """
+ID Composition:
+  ID = (timestamp - EPOCH) << 22  |  datacenter_id << 17  |  machine_id << 12  |  sequence
 
-    DATACENTER_BITS = 5
-    MACHINE_BITS = 5
-    SEQUENCE_BITS = 12
-
-    MAX_DATACENTER_ID = (1 << DATACENTER_BITS) - 1  # 31
-    MAX_MACHINE_ID = (1 << MACHINE_BITS) - 1        # 31
-    MAX_SEQUENCE = (1 << SEQUENCE_BITS) - 1          # 4095
-
-    def __init__(self, datacenter_id, machine_id):
-        if datacenter_id > self.MAX_DATACENTER_ID:
-            raise ValueError(f"Datacenter ID must be <= {self.MAX_DATACENTER_ID}")
-        if machine_id > self.MAX_MACHINE_ID:
-            raise ValueError(f"Machine ID must be <= {self.MAX_MACHINE_ID}")
-
-        self.datacenter_id = datacenter_id
-        self.machine_id = machine_id
-        self.sequence = 0
-        self.last_timestamp = -1
-        self.lock = threading.Lock()
-
-    def generate(self):
-        with self.lock:
-            timestamp = self._current_time_ms()
-
-            if timestamp == self.last_timestamp:
-                self.sequence = (self.sequence + 1) & self.MAX_SEQUENCE
-                if self.sequence == 0:
-                    timestamp = self._wait_next_millis(timestamp)
-            else:
-                self.sequence = 0
-
-            self.last_timestamp = timestamp
-
-            # Compose ID with datacenter and machine
-            id = ((timestamp - self.EPOCH) << 22) | \
-                 (self.datacenter_id << 17) | \
-                 (self.machine_id << 12) | \
-                 self.sequence
-
-            return id
+Use case: Multi-region deployments where you want datacenter encoded in ID
 ```
 
 **Alternative: ULID (Lexicographically Sortable):**
-```python
-class ULIDGenerator:
-    """
-    ULID: Universally Unique Lexicographically Sortable Identifier
+```
+ULID: Universally Unique Lexicographically Sortable Identifier
 
-    Format: 26 characters, Crockford Base32 encoded
-    - 48 bits: Timestamp (milliseconds, good for 10889 years)
-    - 80 bits: Randomness
+Format: 26 characters, Crockford Base32 encoded
+  - 48 bits: Timestamp (milliseconds, good for 10889 years)
+  - 80 bits: Randomness
+  - Total: 128 bits (same as UUID)
 
-    Properties:
-    - Lexicographically sortable (can use string comparison)
-    - Case insensitive
-    - No special characters (URL safe)
-    - 128 bits total (same as UUID)
+Properties:
+  - Lexicographically sortable (string comparison works)
+  - Case insensitive, URL safe (no special characters)
+  - Example: 01ARZ3NDEKTSV4RRFFQ69G5FAV
 
-    Trade-off vs Snowflake:
-    - ULID: No node ID needed, but randomness means tiny collision risk
-    - Snowflake: Guaranteed unique, but requires node ID management
-    """
+GENERATION:
+  1. Get current timestamp in milliseconds
+  2. If same millisecond as last ID:
+     - Increment the random portion by 1 (monotonic within ms)
+     - On overflow: wait for next millisecond
+  3. If new millisecond:
+     - Generate fresh 80 random bits
+  4. Encode to Crockford Base32:
+     - First 10 chars: timestamp (48 bits)
+     - Last 16 chars: randomness (80 bits)
 
-    ENCODING = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford Base32
-
-    def __init__(self):
-        self.last_time = 0
-        self.random_bits = 0
-        self.lock = threading.Lock()
-
-    def generate(self):
-        with self.lock:
-            now = int(time.time() * 1000)
-
-            if now == self.last_time:
-                # Same millisecond - increment random portion
-                self.random_bits += 1
-                if self.random_bits > (1 << 80) - 1:
-                    # Overflow - wait for next millisecond
-                    while int(time.time() * 1000) == now:
-                        pass
-                    now = int(time.time() * 1000)
-                    self.random_bits = random.getrandbits(80)
-            else:
-                # New millisecond - generate new random bits
-                self.random_bits = random.getrandbits(80)
-
-            self.last_time = now
-
-            return self._encode(now, self.random_bits)
-
-    def _encode(self, timestamp, random_bits):
-        """Encode to 26-character Crockford Base32 string"""
-        # 10 chars for timestamp (48 bits)
-        # 16 chars for randomness (80 bits)
-        result = []
-
-        # Encode timestamp (48 bits = 10 chars × 5 bits, with 2 bits padding)
-        for i in range(9, -1, -1):
-            result.append(self.ENCODING[(timestamp >> (i * 5)) & 0x1F])
-
-        # Encode randomness (80 bits = 16 chars × 5 bits)
-        for i in range(15, -1, -1):
-            result.append(self.ENCODING[(random_bits >> (i * 5)) & 0x1F])
-
-        return ''.join(result)
+Trade-off vs Snowflake:
+  - ULID: No node ID management, works anywhere, tiny collision risk
+  - Snowflake: Guaranteed unique, requires node ID coordination
 ```
 
 **ID Generator Service:**
-```python
-class IDGeneratorService:
-    """
-    HTTP service wrapper for Snowflake generator.
-    Supports batch generation for efficiency.
-    """
+```
+HTTP SERVICE WRAPPER:
+  - Wraps Snowflake generator for network access
+  - Supports batch generation for efficiency
 
-    def __init__(self, node_id):
-        self.generator = SnowflakeGenerator(node_id)
-        self.batch_cache = queue.Queue(maxsize=1000)
-        self._start_batch_generator()
+PRE-GENERATION (reduces latency):
+  - Maintain cache of ~1000 pre-generated IDs
+  - Background thread continuously refills cache
+  - When cache drops below 500, generate 100 more
 
-    def _start_batch_generator(self):
-        """Background thread to pre-generate IDs"""
-        def generate_batch():
-            while True:
-                if self.batch_cache.qsize() < 500:
-                    for _ in range(100):
-                        try:
-                            id = self.generator.generate()
-                            self.batch_cache.put(id, block=False)
-                        except queue.Full:
-                            break
-                time.sleep(0.001)
+GET SINGLE ID:
+  1. Try to get from cache (instant, no lock contention)
+  2. If cache empty: generate on-demand (slightly slower)
 
-        thread = threading.Thread(target=generate_batch, daemon=True)
-        thread.start()
-
-    def get_id(self):
-        """Get single ID from pre-generated cache or generate on demand"""
-        try:
-            return self.batch_cache.get_nowait()
-        except queue.Empty:
-            return self.generator.generate()
-
-    def get_ids(self, count):
-        """Get batch of IDs"""
-        ids = []
-        for _ in range(count):
-            ids.append(self.get_id())
-        return ids
+GET BATCH:
+  - Return requested count of IDs
+  - Draws from cache when available, generates when not
 ```
 
 **Deep Dive**
@@ -3615,23 +2618,22 @@ Coordination:
 **Watermark Calculation:**
 
 *Bounded Out-of-Order Watermark:*
-```python
-class BoundedWatermarkGenerator:
-    def __init__(self, max_out_of_order_ms=5000):
-        self.max_out_of_order = max_out_of_order_ms
-        self.max_timestamp_seen = 0
+```
+STATE:
+  - max_out_of_order: allowed lateness (e.g., 5000 ms)
+  - max_timestamp_seen: highest event time observed so far
 
-    def on_event(self, event_time):
-        self.max_timestamp_seen = max(self.max_timestamp_seen, event_time)
+ON EACH EVENT:
+  - Update max_timestamp_seen = max(current, event_time)
 
-    def current_watermark(self):
-        # Watermark = max seen timestamp - allowed lateness
-        return self.max_timestamp_seen - self.max_out_of_order
+CURRENT WATERMARK:
+  - watermark = max_timestamp_seen - max_out_of_order
+  - Meaning: "All events with time < watermark have arrived"
 
-# Example timeline:
-# Event times:  [10:00:01, 10:00:05, 10:00:03, 10:00:08]
-# max_seen:     [10:00:01, 10:00:05, 10:00:05, 10:00:08]
-# watermark:    [09:59:56, 10:00:00, 10:00:00, 10:00:03]  (5s lateness)
+Example timeline (5 second lateness):
+  Event times:  [10:00:01, 10:00:05, 10:00:03, 10:00:08]
+  max_seen:     [10:00:01, 10:00:05, 10:00:05, 10:00:08]
+  watermark:    [09:59:56, 10:00:00, 10:00:00, 10:00:03]
 ```
 
 *Per-Partition Watermarks (Kafka):*
@@ -3645,9 +2647,10 @@ Window [10:00:00-10:00:05] cannot close until slowest partition advances
 ```
 
 *Handling Idle Partitions:*
-```python
-if partition.idle_for > idle_timeout:
-    partition.watermark = current_processing_time  # advance artificially
+```
+If partition has no events for > idle_timeout:
+  → Artificially advance its watermark to current processing time
+  → Prevents one idle partition from blocking global watermark progress
 ```
 
 *Exactly-Once Semantics:*
@@ -3741,30 +2744,27 @@ Data Sources                        Query Engines
 **Z-Ordering Algorithm:**
 
 *Z-Value Calculation (bit interleaving):*
-```python
-def z_order_2d(x, y):
-    """Interleave bits of x and y to create Z-value"""
-    z = 0
-    for i in range(16):  # 16 bits per coordinate
-        z |= ((x & (1 << i)) << i) | ((y & (1 << i)) << (i + 1))
-    return z
-
-# Example: x=5 (0101), y=3 (0011)
-# Interleaved: 00_01_11_01 = 0x1D = 29
-# Points close in 2D space have similar Z-values
 ```
+CONCEPT: Interleave bits of two coordinates to create single Z-value
+  - Points close in 2D space have similar Z-values
+  - Creates space-filling curve (Morton curve)
 
-*Multi-Column Z-Ordering:*
-```python
-def z_order_multi(values, bits_per_col=16):
-    """Z-order for N columns"""
-    z = 0
-    n_cols = len(values)
-    for bit in range(bits_per_col):
-        for col_idx, val in enumerate(values):
-            if val & (1 << bit):
-                z |= 1 << (bit * n_cols + col_idx)
-    return z
+2D EXAMPLE:
+  x = 5 (binary: 0101)
+  y = 3 (binary: 0011)
+
+  Interleave bits: take alternating bits from x and y
+    y3 x3 y2 x2 y1 x1 y0 x0
+     0  0  0  1  1  1  0  1  = 29 (0x1D)
+
+  Result: Z-value = 29
+
+MULTI-COLUMN:
+  For N columns, interleave bits from all columns
+  For each bit position (0 to bits_per_col):
+    For each column:
+      If that bit is set in column value, set corresponding bit in Z-value
+  Result: single integer encoding all column values
 ```
 
 *Delta Lake Usage:*
@@ -3893,28 +2893,23 @@ scheduled → queued → running → success/failed/up_for_retry
 **Backfill Parallelization:**
 
 *Backfill Execution Strategy:*
-```python
-class BackfillController:
-    def __init__(self, dag_id, start_date, end_date, max_parallel=10):
-        self.dag_id = dag_id
-        self.dates = generate_date_range(start_date, end_date)
-        self.max_parallel = max_parallel
-        self.completed = set()
-        self.failed = set()
+```
+STATE:
+  - dag_id: which DAG to backfill
+  - dates: full list of dates to process (start_date to end_date)
+  - max_parallel: how many dates to run concurrently (e.g., 10)
+  - completed: set of successfully completed dates
+  - failed: set of dates that failed
 
-    def get_next_batch(self):
-        """Return next dates to run, respecting parallelism limit"""
-        pending = [d for d in self.dates
-                   if d not in self.completed and d not in self.failed]
-        # Run oldest dates first (dependencies may exist)
-        pending.sort()
-        return pending[:self.max_parallel]
+GET NEXT BATCH:
+  1. Filter out completed and failed dates → pending list
+  2. Sort pending dates (oldest first - dependencies may exist)
+  3. Return up to max_parallel dates to run next
 
-    def on_complete(self, date, success):
-        if success:
-            self.completed.add(date)
-        else:
-            self.failed.add(date)
+ON DATE COMPLETE:
+  - If success: add to completed set
+  - If failure: add to failed set
+  - Then call get_next_batch for more work
 ```
 
 *Dependency-Aware Backfill (DAG with dependencies):*
@@ -3937,19 +2932,15 @@ Execution order (max_parallel=3):
 | Truncate-and-Load | `TRUNCATE TABLE; INSERT...` | Full table refresh |
 
 *Checkpoint/Recovery:*
-```python
-# Save progress to metadata DB
-def checkpoint_state():
-    db.execute("""
-        INSERT INTO backfill_state (dag_id, date, status, completed_at)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (dag_id, date) DO UPDATE SET status = %s
-    """, (dag_id, date, status, now, status))
+```
+SAVE PROGRESS (after each date completes):
+  - INSERT or UPDATE backfill_state table with (dag_id, date, status, completed_at)
+  - Use UPSERT (ON CONFLICT UPDATE) for idempotent saves
 
-# On restart, resume from last checkpoint
-def resume_backfill():
-    completed = db.query("SELECT date FROM backfill_state WHERE status='success'")
-    return [d for d in all_dates if d not in completed]
+RESUME BACKFILL (on restart):
+  1. Query database for all dates with status='success'
+  2. Return remaining dates = all_dates - completed_dates
+  3. Continue processing only unfinished dates
 ```
 
 **Deep Dive**
@@ -4125,56 +3116,36 @@ Auto-scaler:
 **Preemption Strategy:**
 
 *Fair Share Calculation:*
-```python
-def calculate_fair_share(queues, total_resources):
-    """Calculate fair share for each queue based on weight and demand"""
-    total_weight = sum(q.weight for q in queues)
+```
+CALCULATE FAIR SHARE:
+  1. Sum weights of all queues
+  2. For each queue:
+     - fair_share = (queue.weight / total_weight) × total_resources
+     - Constrain: fair_share = min(fair_share, queue.demand)
+       (don't allocate more than queue actually needs)
+  3. Redistribute unused share to queues with unmet demand
 
-    for queue in queues:
-        queue.fair_share = (queue.weight / total_weight) * total_resources
-        # Constrain by actual demand (don't allocate more than needed)
-        queue.fair_share = min(queue.fair_share, queue.demand)
-
-    # Redistribute unused share to queues with unmet demand
-    redistribute_unused(queues, total_resources)
+Example:
+  Queue A: weight=2, demand=40%  → fair_share = 40% (capped by demand)
+  Queue B: weight=3, demand=100% → fair_share = 60% (gets A's unused share)
 ```
 
 *Preemption Decision Algorithm:*
-```python
-def should_preempt(queue, cluster_state):
-    """Determine if queue should preempt resources from others"""
-    # Don't preempt if recently preempted (cooldown period)
-    if time_since_last_preempt(queue) < PREEMPTION_COOLDOWN:  # e.g., 30 sec
-        return False
+```
+SHOULD PREEMPT?
+  1. Cooldown check: If preempted recently (e.g., within 30 sec) → NO
+  2. Calculate shortfall: fair_share - current_allocated
+  3. Significance check: If shortfall < 10% of fair_share → NO (not worth it)
+  4. Find victims: Check if any queue is using >110% of its fair_share
+     - If yes → YES, preempt from over-users
+     - If no → NO (no one to preempt from)
 
-    # Calculate how far below fair share this queue is
-    current_usage = queue.current_allocated
-    shortfall = queue.fair_share - current_usage
-
-    # Only preempt if significantly below fair share (e.g., >10%)
-    if shortfall < queue.fair_share * 0.1:
-        return False
-
-    # Check if there are queues using more than their fair share
-    for other in cluster_state.queues:
-        if other.current_allocated > other.fair_share * 1.1:
-            return True
-    return False
-
-def select_victims(needed_resources, candidate_containers):
-    """Select containers to preempt to free needed resources"""
-    # Sort by: priority (low first), then runtime (short first)
-    candidates = sorted(candidate_containers,
-                       key=lambda c: (c.priority, c.runtime))
-
-    victims = []
-    freed = 0
-    for container in candidates:
-        if freed >= needed_resources:
-            break
-        victims.append(container)
-        freed += container.resources
-    return victims
+SELECT VICTIMS:
+  1. Sort candidate containers by:
+     - Priority (low priority first - preempt least important)
+     - Runtime (shorter runtime first - minimize wasted work)
+  2. Greedily select containers until freed resources >= needed
+  3. Return victim list
 ```
 
 *Graceful Preemption Process:*
